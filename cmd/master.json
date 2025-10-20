@@ -1,0 +1,1 @@
+{"devices":{"raspberry-pi-5":{"versions":{"0.5.0":{"image":"images/raspberry-pi-5/0.5.0/raspberry-pi-5-edgeos-bookworm-arm64-2025-04-15-lite.zip"}}},"test-device":{"versions":{"1.0.0":{"image":"images/test-device/1.0.0/test.img"},"1.0.1":{"image":"images/test-device/1.0.1/test_v2.img"}}}}}

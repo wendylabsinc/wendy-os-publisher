@@ -66,7 +66,7 @@ func main() {
 	log.SetLevel(logrus.InfoLevel)
 
 	// Parse command line arguments
-	bucketName := flag.String("bucket", "edgeos-images-public", "GCS bucket name")
+	bucketName := flag.String("bucket", "wendyos-images-public", "GCS bucket name")
 	deviceType := flag.String("device", "", "Device type (e.g., raspberry-pi-5)")
 	version := flag.String("version", "", "Version number (e.g., 1.0.0)")
 	localFile := flag.String("file", "", "Local file path to upload")

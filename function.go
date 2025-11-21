@@ -60,6 +60,7 @@ type VersionMetadata struct {
 	SizeBytes   int64     `json:"size_bytes"`
 	Changelog   string    `json:"changelog,omitempty"`
 	IsLatest    bool      `json:"is_latest"`
+	IsNightly   bool      `json:"is_nightly,omitempty"`
 }
 
 // MasterManifest represents the top-level manifest
@@ -70,8 +71,9 @@ type MasterManifest struct {
 
 // DeviceLatestInfo holds info about the latest version for a device
 type DeviceLatestInfo struct {
-	Latest       string `json:"latest"`
-	ManifestPath string `json:"manifest_path"`
+	Latest        string `json:"latest"`
+	LatestNightly string `json:"latest_nightly,omitempty"`
+	ManifestPath  string `json:"manifest_path"`
 }
 
 // isOSImage checks if a file is an OS image based on its extension
@@ -142,9 +144,23 @@ func processPubSubMessage(ctx context.Context, e event.Event) error {
 
 	deviceType := parts[1]
 	version := parts[2]
+
+	// Detect if this is a nightly build based on version string only
+	// Check for patterns like: "nightly", "1.0.0-nightly", "nightly-20250121", etc.
+	versionLower := strings.ToLower(version)
+	isNightly := strings.HasPrefix(versionLower, "nightly") ||
+		strings.HasSuffix(versionLower, "nightly") ||
+		strings.Contains(versionLower, "-nightly-") ||
+		strings.Contains(versionLower, "-nightly.") ||
+		strings.Contains(versionLower, "_nightly_") ||
+		strings.Contains(versionLower, "_nightly.") ||
+		strings.Contains(versionLower, ".nightly-") ||
+		strings.Contains(versionLower, ".nightly.")
+
 	logger = logger.WithFields(logrus.Fields{
 		"device_type": deviceType,
 		"version":     version,
+		"is_nightly":  isNightly,
 	})
 	logger.Info("Detected device type and version")
 
@@ -170,14 +186,14 @@ func processPubSubMessage(ctx context.Context, e event.Event) error {
 
 	// Update device manifest
 	logger.Info("Updating device manifest")
-	if err := updateDeviceManifest(ctx, logger, bucket, deviceType, version, filePath, attrs); err != nil {
+	if err := updateDeviceManifest(ctx, logger, bucket, deviceType, version, filePath, attrs, isNightly); err != nil {
 		logger.WithError(err).Error("Failed to update device manifest")
 		return fmt.Errorf("updateDeviceManifest: %v", err)
 	}
 
 	// Update master manifest
 	logger.Info("Updating master manifest")
-	if err := updateMasterManifest(ctx, logger, bucket, deviceType, version); err != nil {
+	if err := updateMasterManifest(ctx, logger, bucket, deviceType, version, isNightly); err != nil {
 		logger.WithError(err).Error("Failed to update master manifest")
 		return fmt.Errorf("updateMasterManifest: %v", err)
 	}
@@ -186,7 +202,7 @@ func processPubSubMessage(ctx context.Context, e event.Event) error {
 	return nil
 }
 
-func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, filePath string, attrs *storage.ObjectAttrs) error {
+func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, filePath string, attrs *storage.ObjectAttrs, isNightly bool) error {
 	manifestPath := fmt.Sprintf("manifests/%s.json", deviceType)
 	logger = logger.WithField("manifest_path", manifestPath)
 	logger.Info("Processing device manifest")
@@ -213,20 +229,47 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 		}
 	}
 
+	// Check if version already exists with a different IsNightly flag
+	if existingVersion, exists := manifest.Versions[version]; exists {
+		if existingVersion.IsNightly != isNightly {
+			errMsg := fmt.Sprintf("version %s already exists as %s build, cannot change to %s build",
+				version,
+				map[bool]string{true: "nightly", false: "stable"}[existingVersion.IsNightly],
+				map[bool]string{true: "nightly", false: "stable"}[isNightly])
+			logger.Error(errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
+		logger.WithField("version", version).Info("Version already exists, updating metadata")
+	}
+
 	// Update version information
-	// Set all existing versions' IsLatest to false
-	for k, v := range manifest.Versions {
-		v.IsLatest = false
-		manifest.Versions[k] = v
+	if isNightly {
+		// For nightly builds, only update nightly versions' IsLatest
+		for k, v := range manifest.Versions {
+			if v.IsNightly {
+				v.IsLatest = false
+				manifest.Versions[k] = v
+			}
+		}
+		logger.WithField("version", version).Info("Setting version as latest nightly")
+	} else {
+		// For stable builds, only update stable versions' IsLatest
+		for k, v := range manifest.Versions {
+			if !v.IsNightly {
+				v.IsLatest = false
+				manifest.Versions[k] = v
+			}
+		}
+		logger.WithField("version", version).Info("Setting version as latest stable")
 	}
 
 	// Add or update this version and mark as latest
-	logger.WithField("version", version).Info("Setting version as latest")
 	manifest.Versions[version] = VersionMetadata{
 		ReleaseDate: time.Now(),
 		Path:        filePath,
 		SizeBytes:   attrs.Size,
 		IsLatest:    true,
+		IsNightly:   isNightly,
 	}
 
 	// Write back to bucket
@@ -244,7 +287,7 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 	return nil
 }
 
-func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version string) error {
+func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version string, isNightly bool) error {
 	masterManifestPath := "manifests/master.json"
 	logger = logger.WithField("manifest_path", masterManifestPath)
 	logger.Info("Processing master manifest")
@@ -274,13 +317,28 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 	logger.WithFields(logrus.Fields{
 		"device_type": deviceType,
 		"version":     version,
+		"is_nightly":  isNightly,
 	}).Info("Updating master manifest")
 
 	masterManifest.LastUpdated = time.Now()
-	masterManifest.Devices[deviceType] = DeviceLatestInfo{
-		Latest:       version,
-		ManifestPath: fmt.Sprintf("manifests/%s.json", deviceType),
+
+	// Get or create device info
+	deviceInfo, exists := masterManifest.Devices[deviceType]
+	if !exists {
+		deviceInfo = DeviceLatestInfo{}
 	}
+
+	// Always set ManifestPath to ensure consistency
+	deviceInfo.ManifestPath = fmt.Sprintf("manifests/%s.json", deviceType)
+
+	// Update the appropriate latest version
+	if isNightly {
+		deviceInfo.LatestNightly = version
+	} else {
+		deviceInfo.Latest = version
+	}
+
+	masterManifest.Devices[deviceType] = deviceInfo
 
 	// Write back to bucket
 	logger.Info("Writing master manifest back to bucket")

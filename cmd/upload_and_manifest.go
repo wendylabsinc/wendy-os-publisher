@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -32,6 +33,7 @@ type VersionMetadata struct {
 	SizeBytes   int64     `json:"size_bytes"`
 	Changelog   string    `json:"changelog,omitempty"`
 	IsLatest    bool      `json:"is_latest"`
+	IsNightly   bool      `json:"is_nightly,omitempty"`
 }
 
 // MasterManifest represents the top-level manifest
@@ -42,8 +44,9 @@ type MasterManifest struct {
 
 // DeviceLatestInfo holds info about the latest version for a device
 type DeviceLatestInfo struct {
-	Latest       string `json:"latest"`
-	ManifestPath string `json:"manifest_path"`
+	Latest        string `json:"latest"`
+	LatestNightly string `json:"latest_nightly,omitempty"`
+	ManifestPath  string `json:"manifest_path"`
 }
 
 // isOSImage checks if a file is an OS image based on its extension
@@ -56,6 +59,100 @@ func isOSImage(filename string) bool {
 		"is_image":  result,
 	}).Info("Checking if file is an OS image")
 	return result
+}
+
+// validateDeviceType checks if the device type is valid
+func validateDeviceType(deviceType string) error {
+	if deviceType == "" {
+		return fmt.Errorf("device type cannot be empty")
+	}
+	if len(deviceType) > 100 {
+		return fmt.Errorf("device type is too long (max 100 characters)")
+	}
+	// Check for invalid characters that could break path parsing
+	invalidChars := []string{"/", "\\", "..", "\x00", "\n", "\r"}
+	for _, char := range invalidChars {
+		if strings.Contains(deviceType, char) {
+			return fmt.Errorf("device type contains invalid character: %q", char)
+		}
+	}
+	return nil
+}
+
+// validateVersion checks if the version is valid
+func validateVersion(version string) error {
+	if version == "" {
+		return fmt.Errorf("version cannot be empty")
+	}
+	if len(version) > 100 {
+		return fmt.Errorf("version is too long (max 100 characters)")
+	}
+	// Check for invalid characters that could break path parsing
+	invalidChars := []string{"/", "\\", "..", "\x00", "\n", "\r"}
+	for _, char := range invalidChars {
+		if strings.Contains(version, char) {
+			return fmt.Errorf("version contains invalid character: %q", char)
+		}
+	}
+	return nil
+}
+
+// validateFileExists checks if the file exists and is readable
+func validateFileExists(filePath string) error {
+	if filePath == "" {
+		return fmt.Errorf("file path cannot be empty")
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("file does not exist: %s", filePath)
+		}
+		return fmt.Errorf("cannot access file: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("path is a directory, not a file: %s", filePath)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("file is empty: %s", filePath)
+	}
+	return nil
+}
+
+// createStorageClientWithAuth creates a storage client and triggers authentication if needed
+func createStorageClientWithAuth(ctx context.Context) (*storage.Client, error) {
+	// Try to create the client
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		// Check if this is an authentication error
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "could not find default credentials") ||
+			strings.Contains(errMsg, "application default credentials") ||
+			strings.Contains(errMsg, "credential") {
+			log.Warn("Authentication credentials not found. Triggering gcloud auth...")
+
+			// Run gcloud auth application-default login
+			cmd := exec.Command("gcloud", "auth", "application-default", "login")
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+
+			if err := cmd.Run(); err != nil {
+				return nil, fmt.Errorf("authentication failed: %w", err)
+			}
+
+			log.Info("Authentication successful. Retrying storage client creation...")
+
+			// Retry creating the client
+			client, err = storage.NewClient(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create storage client after authentication: %w", err)
+			}
+		} else {
+			return nil, err
+		}
+	}
+
+	return client, nil
 }
 
 func main() {
@@ -73,6 +170,7 @@ func main() {
 	updateOnly := flag.Bool("update-only", false, "Only update manifests without uploading")
 	listImages := flag.Bool("list", false, "List all images in the bucket")
 	createDevice := flag.Bool("create-device", false, "Create a new device type in the manifest")
+	nightly := flag.Bool("nightly", false, "Mark this build as a nightly/untested build")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
@@ -85,22 +183,27 @@ func main() {
 		// No other args needed for listing
 	} else if *createDevice {
 		// For creating a device, we only need the device type
-		if *deviceType == "" {
-			log.Fatal("Device type is required when creating a new device")
+		if err := validateDeviceType(*deviceType); err != nil {
+			log.WithError(err).Fatal("Invalid device type")
 		}
 	} else {
 		// For normal operations, we need device type and version
-		if *deviceType == "" || *version == "" {
-			log.Fatal("Device type and version are required")
+		if err := validateDeviceType(*deviceType); err != nil {
+			log.WithError(err).Fatal("Invalid device type")
 		}
-		if !*updateOnly && *localFile == "" {
-			log.Fatal("Local file path is required for upload")
+		if err := validateVersion(*version); err != nil {
+			log.WithError(err).Fatal("Invalid version")
+		}
+		if !*updateOnly {
+			if err := validateFileExists(*localFile); err != nil {
+				log.WithError(err).Fatal("Invalid file")
+			}
 		}
 	}
 
 	// Create context and storage client
 	ctx := context.Background()
-	client, err := storage.NewClient(ctx)
+	client, err := createStorageClientWithAuth(ctx)
 	if err != nil {
 		log.WithError(err).Fatal("Failed to create storage client")
 	}
@@ -137,7 +240,7 @@ func main() {
 		}
 
 		// Update manifests
-		updateManifests(ctx, bucket, *deviceType, *version, destinationPath, attrs.Size)
+		updateManifests(ctx, bucket, *deviceType, *version, destinationPath, attrs.Size, *nightly)
 	} else {
 		// Just update manifests for existing file
 		imagePath := fmt.Sprintf("images/%s/%s/%s", *deviceType, *version, filepath.Base(*localFile))
@@ -149,7 +252,7 @@ func main() {
 			return
 		}
 
-		updateManifests(ctx, bucket, *deviceType, *version, imagePath, attrs.Size)
+		updateManifests(ctx, bucket, *deviceType, *version, imagePath, attrs.Size, *nightly)
 	}
 }
 
@@ -262,22 +365,23 @@ func uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, de
 	return destinationPath
 }
 
-func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64) {
+func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, isNightly bool) {
 	logger := log.WithFields(logrus.Fields{
 		"device_type": deviceType,
 		"version":     version,
 		"file_path":   filePath,
+		"is_nightly":  isNightly,
 	})
 	logger.Info("Updating manifests")
 
 	// Update device manifest
-	updateDeviceManifest(ctx, logger, bucket, deviceType, version, filePath, fileSize)
+	updateDeviceManifest(ctx, logger, bucket, deviceType, version, filePath, fileSize, isNightly)
 
 	// Update master manifest
-	updateMasterManifest(ctx, logger, bucket, deviceType, version)
+	updateMasterManifest(ctx, logger, bucket, deviceType, version, isNightly)
 }
 
-func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64) {
+func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, isNightly bool) {
 	manifestPath := fmt.Sprintf("manifests/%s.json", deviceType)
 	logger = logger.WithField("manifest_path", manifestPath)
 	logger.Info("Processing device manifest")
@@ -314,20 +418,47 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 		}
 	}
 
+	// Check if version already exists with a different IsNightly flag
+	if existingVersion, exists := manifest.Versions[version]; exists {
+		if existingVersion.IsNightly != isNightly {
+			errMsg := fmt.Sprintf("version %s already exists as %s build, cannot change to %s build",
+				version,
+				map[bool]string{true: "nightly", false: "stable"}[existingVersion.IsNightly],
+				map[bool]string{true: "nightly", false: "stable"}[isNightly])
+			logger.Error(errMsg)
+			return
+		}
+		logger.WithField("version", version).Info("Version already exists, updating metadata")
+	}
+
 	// Update version information
-	// Set all existing versions' IsLatest to false
-	for k, v := range manifest.Versions {
-		v.IsLatest = false
-		manifest.Versions[k] = v
+	if isNightly {
+		// For nightly builds, only update nightly versions' IsLatest
+		for k, v := range manifest.Versions {
+			if v.IsNightly {
+				v.IsLatest = false
+				manifest.Versions[k] = v
+			}
+		}
+		logger.WithField("version", version).Info("Setting version as latest nightly")
+	} else {
+		// For stable builds, only update stable versions' IsLatest
+		for k, v := range manifest.Versions {
+			if !v.IsNightly {
+				v.IsLatest = false
+				manifest.Versions[k] = v
+			}
+		}
+		logger.WithField("version", version).Info("Setting version as latest stable")
 	}
 
 	// Add or update this version and mark as latest
-	logger.WithField("version", version).Info("Setting version as latest")
 	manifest.Versions[version] = VersionMetadata{
 		ReleaseDate: time.Now(),
 		Path:        filePath,
 		SizeBytes:   fileSize,
 		IsLatest:    true,
+		IsNightly:   isNightly,
 	}
 
 	// Write back to bucket
@@ -351,7 +482,7 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 	logger.Info("Successfully wrote device manifest")
 }
 
-func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version string) {
+func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version string, isNightly bool) {
 	masterManifestPath := "manifests/master.json"
 	logger = logger.WithField("manifest_path", masterManifestPath)
 	logger.Info("Processing master manifest")
@@ -391,13 +522,28 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 	logger.WithFields(logrus.Fields{
 		"device_type": deviceType,
 		"version":     version,
+		"is_nightly":  isNightly,
 	}).Info("Updating master manifest")
 
 	masterManifest.LastUpdated = time.Now()
-	masterManifest.Devices[deviceType] = DeviceLatestInfo{
-		Latest:       version,
-		ManifestPath: fmt.Sprintf("manifests/%s.json", deviceType),
+
+	// Get or create device info
+	deviceInfo, exists := masterManifest.Devices[deviceType]
+	if !exists {
+		deviceInfo = DeviceLatestInfo{}
 	}
+
+	// Always set ManifestPath to ensure consistency
+	deviceInfo.ManifestPath = fmt.Sprintf("manifests/%s.json", deviceType)
+
+	// Update the appropriate latest version
+	if isNightly {
+		deviceInfo.LatestNightly = version
+	} else {
+		deviceInfo.Latest = version
+	}
+
+	masterManifest.Devices[deviceType] = deviceInfo
 
 	// Write back to bucket
 	logger.Info("Writing master manifest back to bucket")

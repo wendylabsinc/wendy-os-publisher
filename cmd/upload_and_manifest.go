@@ -47,6 +47,7 @@ type DeviceLatestInfo struct {
 	Latest        string `json:"latest"`
 	LatestNightly string `json:"latest_nightly,omitempty"`
 	ManifestPath  string `json:"manifest_path"`
+	Stability     string `json:"stability,omitempty"` // "stable", "experimental", "deprecated"
 }
 
 // isOSImage checks if a file is an OS image based on its extension
@@ -118,6 +119,21 @@ func validateFileExists(filePath string) error {
 	return nil
 }
 
+// validateStability checks if the stability value is valid
+func validateStability(stability string) error {
+	if stability == "" {
+		// Empty is allowed, defaults to stable
+		return nil
+	}
+	validStabilities := []string{"stable", "experimental", "deprecated"}
+	for _, valid := range validStabilities {
+		if stability == valid {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid stability value: %s (must be one of: stable, experimental, deprecated)", stability)
+}
+
 // createStorageClientWithAuth creates a storage client and triggers authentication if needed
 func createStorageClientWithAuth(ctx context.Context) (*storage.Client, error) {
 	// Try to create the client
@@ -171,6 +187,7 @@ func main() {
 	listImages := flag.Bool("list", false, "List all images in the bucket")
 	createDevice := flag.Bool("create-device", false, "Create a new device type in the manifest")
 	nightly := flag.Bool("nightly", false, "Mark this build as a nightly/untested build")
+	stability := flag.String("stability", "stable", "Device stability level: stable, experimental, deprecated")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
@@ -186,6 +203,9 @@ func main() {
 		if err := validateDeviceType(*deviceType); err != nil {
 			log.WithError(err).Fatal("Invalid device type")
 		}
+		if err := validateStability(*stability); err != nil {
+			log.WithError(err).Fatal("Invalid stability")
+		}
 	} else {
 		// For normal operations, we need device type and version
 		if err := validateDeviceType(*deviceType); err != nil {
@@ -193,6 +213,9 @@ func main() {
 		}
 		if err := validateVersion(*version); err != nil {
 			log.WithError(err).Fatal("Invalid version")
+		}
+		if err := validateStability(*stability); err != nil {
+			log.WithError(err).Fatal("Invalid stability")
 		}
 		if !*updateOnly {
 			if err := validateFileExists(*localFile); err != nil {
@@ -219,7 +242,7 @@ func main() {
 
 	// Create device if requested
 	if *createDevice {
-		createNewDevice(ctx, bucket, *deviceType)
+		createNewDevice(ctx, bucket, *deviceType, *stability)
 		return
 	}
 
@@ -240,7 +263,7 @@ func main() {
 		}
 
 		// Update manifests
-		updateManifests(ctx, bucket, *deviceType, *version, destinationPath, attrs.Size, *nightly)
+		updateManifests(ctx, bucket, *deviceType, *version, destinationPath, attrs.Size, *nightly, *stability)
 	} else {
 		// Just update manifests for existing file
 		imagePath := fmt.Sprintf("images/%s/%s/%s", *deviceType, *version, filepath.Base(*localFile))
@@ -252,7 +275,7 @@ func main() {
 			return
 		}
 
-		updateManifests(ctx, bucket, *deviceType, *version, imagePath, attrs.Size, *nightly)
+		updateManifests(ctx, bucket, *deviceType, *version, imagePath, attrs.Size, *nightly, *stability)
 	}
 }
 
@@ -365,12 +388,13 @@ func uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, de
 	return destinationPath
 }
 
-func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, isNightly bool) {
+func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, isNightly bool, stability string) {
 	logger := log.WithFields(logrus.Fields{
 		"device_type": deviceType,
 		"version":     version,
 		"file_path":   filePath,
 		"is_nightly":  isNightly,
+		"stability":   stability,
 	})
 	logger.Info("Updating manifests")
 
@@ -378,7 +402,7 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 	updateDeviceManifest(ctx, logger, bucket, deviceType, version, filePath, fileSize, isNightly)
 
 	// Update master manifest
-	updateMasterManifest(ctx, logger, bucket, deviceType, version, isNightly)
+	updateMasterManifest(ctx, logger, bucket, deviceType, version, isNightly, stability)
 }
 
 func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, isNightly bool) {
@@ -482,7 +506,7 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 	logger.Info("Successfully wrote device manifest")
 }
 
-func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version string, isNightly bool) {
+func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version string, isNightly bool, stability string) {
 	masterManifestPath := "manifests/master.json"
 	logger = logger.WithField("manifest_path", masterManifestPath)
 	logger.Info("Processing master manifest")
@@ -523,6 +547,7 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 		"device_type": deviceType,
 		"version":     version,
 		"is_nightly":  isNightly,
+		"stability":   stability,
 	}).Info("Updating master manifest")
 
 	masterManifest.LastUpdated = time.Now()
@@ -535,6 +560,12 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	// Always set ManifestPath to ensure consistency
 	deviceInfo.ManifestPath = fmt.Sprintf("manifests/%s.json", deviceType)
+
+	// Set stability (defaults to "stable" if empty)
+	if stability == "" {
+		stability = "stable"
+	}
+	deviceInfo.Stability = stability
 
 	// Update the appropriate latest version
 	if isNightly {
@@ -567,8 +598,11 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 }
 
 // createNewDevice creates a new device type in both manifests
-func createNewDevice(ctx context.Context, bucket *storage.BucketHandle, deviceType string) {
-	logger := log.WithField("device_type", deviceType)
+func createNewDevice(ctx context.Context, bucket *storage.BucketHandle, deviceType string, stability string) {
+	logger := log.WithFields(logrus.Fields{
+		"device_type": deviceType,
+		"stability":   stability,
+	})
 	logger.Info("Creating new device type")
 
 	// Create empty device manifest
@@ -618,9 +652,16 @@ func createNewDevice(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 
 	// Add the new device to master manifest
 	masterManifest.LastUpdated = time.Now()
+
+	// Set stability (defaults to "stable" if empty)
+	if stability == "" {
+		stability = "stable"
+	}
+
 	masterManifest.Devices[deviceType] = DeviceLatestInfo{
 		Latest:       "",
 		ManifestPath: manifestPath,
+		Stability:    stability,
 	}
 
 	// Write master manifest

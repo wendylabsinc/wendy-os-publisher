@@ -353,7 +353,7 @@ func main() {
 
 	// Swap image file if requested
 	if *swap {
-		swapImageFile(ctx, bucket, *deviceType, *version, *localFile, *nightly)
+		swapImageFile(ctx, bucket, *deviceType, *version, *localFile, *recoveryFile, *nightly)
 		return
 	}
 
@@ -714,7 +714,7 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 }
 
 // swapUpdateDeviceManifest updates device manifest for a swap operation, preserving historical metadata
-func swapUpdateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, newPath, newChecksum string, newSize int64, existingMeta VersionMetadata) error {
+func swapUpdateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, newPath, newChecksum string, newSize int64, recoveryPath *string, recoveryChecksum *string, recoverySize *int64, existingMeta VersionMetadata) error {
 	manifestPath := fmt.Sprintf("manifests/%s.json", deviceType)
 	logger = logger.WithField("manifest_path", manifestPath)
 	logger.Info("Updating device manifest for swap operation")
@@ -751,6 +751,17 @@ func swapUpdateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket 
 	}
 	swappedAt := time.Now()
 
+	// Determine recovery file fields (use new if provided, otherwise preserve existing)
+	finalRecoveryPath := recoveryPath
+	finalRecoveryChecksum := recoveryChecksum
+	finalRecoverySize := recoverySize
+	if recoveryPath == nil {
+		// No new recovery file provided, preserve existing
+		finalRecoveryPath = currentVersion.RecoveryPath
+		finalRecoveryChecksum = currentVersion.RecoveryChecksum
+		finalRecoverySize = currentVersion.RecoverySizeBytes
+	}
+
 	// Build new metadata preserving historical fields
 	updatedVersion := VersionMetadata{
 		// Preserved fields
@@ -761,10 +772,10 @@ func swapUpdateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket 
 		PromotedFrom: currentVersion.PromotedFrom,
 		PromotedAt:   currentVersion.PromotedAt,
 
-		// Preserved recovery file fields (swap only affects main image)
-		RecoveryPath:      currentVersion.RecoveryPath,
-		RecoveryChecksum:  currentVersion.RecoveryChecksum,
-		RecoverySizeBytes: currentVersion.RecoverySizeBytes,
+		// Recovery file fields (updated if new file provided, otherwise preserved)
+		RecoveryPath:      finalRecoveryPath,
+		RecoveryChecksum:  finalRecoveryChecksum,
+		RecoverySizeBytes: finalRecoverySize,
 
 		// Updated fields
 		Path:      newPath,
@@ -1195,13 +1206,15 @@ func updateMasterManifestForPromotion(ctx context.Context, logger *logrus.Entry,
 }
 
 // swapImageFile replaces an existing version's image file while preserving metadata
-func swapImageFile(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, localFile string, isNightly bool) {
+// If recoveryFile is provided, it will also swap the recovery file
+func swapImageFile(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, localFile, recoveryFile string, isNightly bool) {
 	logger := log.WithFields(logrus.Fields{
-		"device_type": deviceType,
-		"version":     version,
-		"local_file":  localFile,
-		"is_nightly":  isNightly,
-		"operation":   "swap",
+		"device_type":   deviceType,
+		"version":       version,
+		"local_file":    localFile,
+		"recovery_file": recoveryFile,
+		"is_nightly":    isNightly,
+		"operation":     "swap",
 	})
 	logger.Info("Starting image file swap")
 
@@ -1341,8 +1354,55 @@ func swapImageFile(ctx context.Context, bucket *storage.BucketHandle, deviceType
 
 	logger.WithField("checksum", checksum).Info("Checksum calculated")
 
+	// Step 5b: Upload and checksum recovery file if provided
+	var recoveryPath *string
+	var recoveryChecksum *string
+	var recoverySize *int64
+	if recoveryFile != "" {
+		logger.Info("Uploading recovery file")
+
+		recoveryFilename := filepath.Base(recoveryFile)
+
+		// Warn if recovery filename changed
+		if existingVersion.RecoveryPath != nil {
+			oldRecoveryFilename := filepath.Base(*existingVersion.RecoveryPath)
+			if recoveryFilename != oldRecoveryFilename {
+				logger.WithFields(logrus.Fields{
+					"old_filename": oldRecoveryFilename,
+					"new_filename": recoveryFilename,
+				}).Warn("Recovery filename changed during swap - old file will be orphaned")
+			}
+		}
+
+		// Upload recovery file (reuse uploadFile function)
+		uploadedRecoveryPath := uploadFile(ctx, bucket, recoveryFile, deviceType, version)
+		if uploadedRecoveryPath == "" {
+			logger.Fatal("Failed to upload recovery file")
+		}
+		recoveryPath = &uploadedRecoveryPath
+
+		// Get recovery file size
+		recoveryObj := bucket.Object(uploadedRecoveryPath)
+		recoveryAttrs, err := recoveryObj.Attrs(ctx)
+		if err != nil {
+			logger.WithError(err).Fatal("Failed to get recovery file attributes")
+		}
+		recoverySize = &recoveryAttrs.Size
+
+		// Calculate recovery file checksum
+		logger.Info("Calculating recovery file checksum")
+		recoveryChecksumValue := calculateFileChecksum(ctx, bucket, uploadedRecoveryPath, logger)
+		recoveryChecksum = &recoveryChecksumValue
+
+		logger.WithFields(logrus.Fields{
+			"recovery_path":     uploadedRecoveryPath,
+			"recovery_checksum": recoveryChecksumValue,
+			"recovery_size":     recoveryAttrs.Size,
+		}).Info("Recovery file uploaded and checksummed")
+	}
+
 	// Step 6: Update device manifest with preserved metadata
-	if err := swapUpdateDeviceManifest(ctx, logger, bucket, deviceType, version, destinationPath, checksum, bytesWritten, existingVersion); err != nil {
+	if err := swapUpdateDeviceManifest(ctx, logger, bucket, deviceType, version, destinationPath, checksum, bytesWritten, recoveryPath, recoveryChecksum, recoverySize, existingVersion); err != nil {
 		logger.WithError(err).Fatal("Failed to update device manifest")
 	}
 

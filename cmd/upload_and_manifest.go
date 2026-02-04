@@ -1234,10 +1234,20 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 
 	logger.Info("Manifests updated successfully")
 
+	// Small delay to ensure manifest write is fully propagated
+	// GCS is strongly consistent but adding safety margin
+	time.Sleep(2 * time.Second)
+
 	// Verify the upload before sending notifications
 	logger.Info("Verifying upload integrity...")
 	if err := verifyUpload(ctx, logger, bucket, deviceType, version, filePath, fileChecksum, otaUpdatePath, otaUpdateChecksum, recoveryPath, recoveryChecksum); err != nil {
-		logger.WithError(err).Fatal("Upload verification failed - manifest may be corrupted")
+		logger.WithError(err).Warn("Upload verification failed - manifest may be corrupted. Retrying once...")
+
+		// Retry once after brief delay
+		time.Sleep(2 * time.Second)
+		if err := verifyUpload(ctx, logger, bucket, deviceType, version, filePath, fileChecksum, otaUpdatePath, otaUpdateChecksum, recoveryPath, recoveryChecksum); err != nil {
+			logger.WithError(err).Fatal("Upload verification failed after retry")
+		}
 	}
 	logger.Info("Upload verification passed")
 
@@ -1275,11 +1285,24 @@ func verifyUpload(ctx context.Context, logger *logrus.Entry, bucket *storage.Buc
 		return fmt.Errorf("failed to parse manifest JSON: %w", err)
 	}
 
+	logger.WithFields(logrus.Fields{
+		"manifest_device_id": manifest.DeviceID,
+		"version_count":      len(manifest.Versions),
+		"looking_for":        version,
+	}).Debug("Manifest loaded for verification")
+
 	// Verify version exists in manifest
 	versionData, exists := manifest.Versions[version]
 	if !exists {
 		return fmt.Errorf("version %s not found in manifest after update", version)
 	}
+
+	logger.WithFields(logrus.Fields{
+		"path":          versionData.Path,
+		"ota_path":      versionData.OTAUpdatePath,
+		"recovery_path": versionData.RecoveryPath,
+		"size":          versionData.SizeBytes,
+	}).Debug("Version data retrieved from manifest")
 
 	logger.WithFields(logrus.Fields{
 		"version":                version,

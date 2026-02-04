@@ -1,23 +1,45 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/oauth2"
 	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
 )
 
 var log = logrus.New()
+
+// Discord webhook URL for notifications
+const discordWebhookURL = "https://discord.com/api/webhooks/1465939532699402322/S7UbyqSjmXOxeiTZige8sYUSdTJS8eTnKnYhdR0RqQEHPJgWZwPFMdFSd0kbH-jwmM1K"
+
+// Discord embed colors
+const (
+	colorStable  = 0x00FF00 // Green for stable builds
+	colorNightly = 0xFFA500 // Orange for nightly builds
+)
+
+// Validation constants
+const (
+	maxDeviceTypeLength = 100 // GCS object path component limit
+	maxVersionLength    = 100 // GCS object path component limit
+)
 
 // DeviceManifest represents a device-specific manifest
 type DeviceManifest struct {
@@ -27,13 +49,16 @@ type DeviceManifest struct {
 
 // VersionMetadata contains metadata about a specific OS version
 type VersionMetadata struct {
-	ReleaseDate time.Time `json:"release_date"`
-	Path        string    `json:"path"`
-	Checksum    string    `json:"checksum,omitempty"`
-	SizeBytes   int64     `json:"size_bytes"`
-	Changelog   string    `json:"changelog,omitempty"`
-	IsLatest    bool      `json:"is_latest"`
-	IsNightly   bool      `json:"is_nightly,omitempty"`
+	ReleaseDate          time.Time `json:"release_date"`
+	Path                 string    `json:"path"`
+	Checksum             string    `json:"checksum,omitempty"`
+	SizeBytes            int64     `json:"size_bytes"`
+	Changelog            string    `json:"changelog,omitempty"`
+	IsLatest             bool      `json:"is_latest"`
+	IsNightly            bool      `json:"is_nightly,omitempty"`
+	OTAUpdatePath        string    `json:"ota_update_path,omitempty"`
+	OTAUpdateChecksum    string    `json:"ota_update_checksum,omitempty"`
+	OTAUpdateSizeBytes   int64     `json:"ota_update_size_bytes,omitempty"`
 }
 
 // MasterManifest represents the top-level manifest
@@ -53,7 +78,7 @@ type DeviceLatestInfo struct {
 // isOSImage checks if a file is an OS image based on its extension
 func isOSImage(filename string) bool {
 	ext := strings.ToLower(filepath.Ext(filename))
-	result := ext == ".img" || ext == ".zip" || ext == ".tgz"
+	result := ext == ".img" || ext == ".zip" || ext == ".tgz" || ext == ".xz" || ext == ".zst" || ext == ".mender"
 	log.WithFields(logrus.Fields{
 		"filename":  filename,
 		"extension": ext,
@@ -67,8 +92,8 @@ func validateDeviceType(deviceType string) error {
 	if deviceType == "" {
 		return fmt.Errorf("device type cannot be empty")
 	}
-	if len(deviceType) > 100 {
-		return fmt.Errorf("device type is too long (max 100 characters)")
+	if len(deviceType) > maxDeviceTypeLength {
+		return fmt.Errorf("device type is too long (max %d characters)", maxDeviceTypeLength)
 	}
 	// Check for invalid characters that could break path parsing
 	invalidChars := []string{"/", "\\", "..", "\x00", "\n", "\r"}
@@ -85,8 +110,8 @@ func validateVersion(version string) error {
 	if version == "" {
 		return fmt.Errorf("version cannot be empty")
 	}
-	if len(version) > 100 {
-		return fmt.Errorf("version is too long (max 100 characters)")
+	if len(version) > maxVersionLength {
+		return fmt.Errorf("version is too long (max %d characters)", maxVersionLength)
 	}
 	// Check for invalid characters that could break path parsing
 	invalidChars := []string{"/", "\\", "..", "\x00", "\n", "\r"}
@@ -134,9 +159,425 @@ func validateStability(stability string) error {
 	return fmt.Errorf("invalid stability value: %s (must be one of: stable, experimental, deprecated)", stability)
 }
 
+// DiscordEmbed represents an embed in a Discord message
+type DiscordEmbed struct {
+	Title       string                 `json:"title,omitempty"`
+	Description string                 `json:"description,omitempty"`
+	Color       int                    `json:"color,omitempty"`
+	Fields      []DiscordEmbedField    `json:"fields,omitempty"`
+	Timestamp   string                 `json:"timestamp,omitempty"`
+}
+
+// DiscordEmbedField represents a field in a Discord embed
+type DiscordEmbedField struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Inline bool   `json:"inline"`
+}
+
+// DiscordWebhookPayload represents the payload sent to Discord
+type DiscordWebhookPayload struct {
+	Content string         `json:"content,omitempty"`
+	Embeds  []DiscordEmbed `json:"embeds,omitempty"`
+}
+
+// fileProcessResult holds the result of processing a file (compression + checksum)
+type fileProcessResult struct {
+	compressedPath string
+	checksum       string
+	err            error
+}
+
+// processFileAsync compresses and calculates checksum concurrently
+func processFileAsync(ctx context.Context, filePath string) <-chan fileProcessResult {
+	resultChan := make(chan fileProcessResult, 1)
+
+	go func() {
+		defer close(resultChan)
+
+		// Check if context was cancelled
+		select {
+		case <-ctx.Done():
+			resultChan <- fileProcessResult{err: ctx.Err()}
+			return
+		default:
+		}
+
+		// Compress file if needed
+		compressedPath, err := compressFile(ctx, filePath)
+		if err != nil {
+			resultChan <- fileProcessResult{err: fmt.Errorf("compression failed: %w", err)}
+			return
+		}
+
+		// Check cancellation again before checksum
+		select {
+		case <-ctx.Done():
+			resultChan <- fileProcessResult{err: ctx.Err()}
+			return
+		default:
+		}
+
+		// Calculate checksum
+		checksum, err := calculateChecksum(compressedPath)
+		if err != nil {
+			resultChan <- fileProcessResult{err: fmt.Errorf("checksum calculation failed: %w", err)}
+			return
+		}
+
+		resultChan <- fileProcessResult{
+			compressedPath: compressedPath,
+			checksum:       checksum,
+		}
+	}()
+
+	return resultChan
+}
+
+// uploadResult holds the result of an upload operation
+type uploadResult struct {
+	path string
+	size int64
+	err  error
+}
+
+// uploadFileAsync uploads a file asynchronously
+func uploadFileAsync(ctx context.Context, bucket *storage.BucketHandle, localPath, deviceType, version string) <-chan uploadResult {
+	resultChan := make(chan uploadResult, 1)
+
+	go func() {
+		defer close(resultChan)
+
+		path, err := uploadFile(ctx, bucket, localPath, deviceType, version)
+		if err != nil {
+			resultChan <- uploadResult{err: err}
+			return
+		}
+
+		// Get file size
+		obj := bucket.Object(path)
+		attrs, err := obj.Attrs(ctx)
+		if err != nil {
+			resultChan <- uploadResult{err: fmt.Errorf("failed to get file attributes: %w", err)}
+			return
+		}
+
+		resultChan <- uploadResult{
+			path: path,
+			size: attrs.Size,
+		}
+	}()
+
+	return resultChan
+}
+
+// calculateChecksum calculates the SHA256 checksum of a file
+func calculateChecksum(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open file for checksum: %w", err)
+	}
+	defer file.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", fmt.Errorf("failed to calculate checksum: %w", err)
+	}
+
+	checksum := hex.EncodeToString(hash.Sum(nil))
+	log.WithFields(logrus.Fields{
+		"file":     filePath,
+		"checksum": checksum,
+	}).Debug("Calculated SHA256 checksum")
+
+	return checksum, nil
+}
+
+// compressFile compresses a file using xz with maximum compression
+// Returns the path to the compressed file, or the original path if compression not needed
+func compressFile(ctx context.Context, inputPath string) (string, error) {
+	// Check for cancellation before starting
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	default:
+	}
+
+	ext := strings.ToLower(filepath.Ext(inputPath))
+
+	// Only compress .img and .mender (OTA update) files
+	if ext != ".img" && ext != ".mender" {
+		log.WithField("path", inputPath).Info("File doesn't need compression, using as-is")
+		return inputPath, nil
+	}
+
+	// Get file size for progress calculation
+	fileInfo, err := os.Stat(inputPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to stat file: %w", err)
+	}
+	fileSize := fileInfo.Size()
+
+	// Determine compression method based on file type
+	// OTA files (.mender) use xz, OS images (.img) use zip
+	isOTA := ext == ".mender"
+	var outputPath string
+	var compressionMethod string
+
+	if isOTA {
+		outputPath = inputPath + ".xz"
+		compressionMethod = "xz -9e"
+	} else {
+		outputPath = inputPath + ".zip"
+		compressionMethod = "zip -9"
+	}
+
+	// Check if compressed file already exists
+	if _, err := os.Stat(outputPath); err == nil {
+		log.WithField("path", outputPath).Info("Compressed file already exists, using existing file")
+		return outputPath, nil
+	}
+
+	log.WithFields(logrus.Fields{
+		"input":  inputPath,
+		"output": outputPath,
+		"size":   fileSize,
+		"method": compressionMethod,
+	}).Info("Compressing file...")
+
+	var cmd *exec.Cmd
+	var outFile *os.File // Declare at function scope for proper cleanup
+
+	if isOTA {
+		// Use xz for OTA files (maximum compression)
+		// Check if pv is available for progress
+		pvCmd := exec.Command("which", "pv")
+		hasPv := pvCmd.Run() == nil
+
+		if hasPv {
+			// Use pv for progress indication: pv input.mender | xz -9e > output.xz
+			log.Info("Using pv for progress indication")
+			cmd = exec.Command("sh", "-c", fmt.Sprintf("pv '%s' | xz -9e > '%s'", inputPath, outputPath))
+			cmd.Stdout = os.Stdout
+		} else {
+			// Fallback to xz with verbose mode
+			log.Info("pv not found, using xz verbose mode")
+			cmd = exec.Command("xz", "-9e", "-v", "-k", "-c", inputPath)
+			var err error
+			outFile, err = os.Create(outputPath)
+			if err != nil {
+				return "", fmt.Errorf("failed to create output file: %w", err)
+			}
+			cmd.Stdout = outFile
+		}
+		cmd.Stderr = os.Stderr
+	} else {
+		// Use zip for OS images
+		// zip -9 -q creates a .zip file with maximum compression
+		// We need to change to the directory and zip from there to avoid including full paths
+		dir := filepath.Dir(inputPath)
+		filename := filepath.Base(inputPath)
+		zipFilename := filename + ".zip"
+
+		cmd = exec.Command("zip", "-9", zipFilename, filename)
+		cmd.Dir = dir
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
+
+	// Ensure outFile is closed when function returns
+	defer func() {
+		if outFile != nil {
+			if err := outFile.Close(); err != nil {
+				log.WithError(err).Error("Failed to close output file")
+			}
+		}
+	}()
+
+	// Start the compression process
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("failed to start compression: %w", err)
+	}
+
+	// Wait for completion or cancellation
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Context cancelled, kill the process
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+			// Give process time to release file handles
+			time.Sleep(100 * time.Millisecond)
+		}
+		// Clean up partial file, ignore error if file doesn't exist
+		if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
+			log.WithError(err).Warn("Failed to clean up partial compressed file")
+		}
+		return "", ctx.Err()
+	case err := <-done:
+		if err != nil {
+			// Clean up partial file on failure
+			if rmErr := os.Remove(outputPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				log.WithError(rmErr).Warn("Failed to clean up partial compressed file")
+			}
+			return "", fmt.Errorf("compression failed: %w", err)
+		}
+	}
+
+	// Verify compressed file exists and get its size
+	compressedInfo, err := os.Stat(outputPath)
+	if err != nil {
+		return "", fmt.Errorf("compressed file not found: %w", err)
+	}
+
+	compressionRatio := float64(fileSize-compressedInfo.Size()) / float64(fileSize) * 100
+
+	log.WithFields(logrus.Fields{
+		"original_size":   fileSize,
+		"compressed_size": compressedInfo.Size(),
+		"saved":           fmt.Sprintf("%.1f%%", compressionRatio),
+	}).Info("Compression complete")
+
+	return outputPath, nil
+}
+
+// sendDiscordNotification sends a notification to Discord about the update
+func sendDiscordNotification(deviceType, version string, isNightly bool, osSize int64, otaSize int64) error {
+	buildType := "Stable"
+	color := colorStable
+	if isNightly {
+		buildType = "Nightly"
+		color = colorNightly
+	}
+
+	// Format OS image size
+	osSizeStr := fmt.Sprintf("%.2f MB", float64(osSize)/(1024*1024))
+
+	// Calculate total size
+	totalSize := osSize
+	if otaSize > 0 {
+		totalSize += otaSize
+	}
+	totalSizeStr := fmt.Sprintf("%.2f MB", float64(totalSize)/(1024*1024))
+
+	// Build components list
+	components := []string{"📦 OS Image"}
+	if otaSize > 0 {
+		components = append(components, "🔄 OTA Update")
+	}
+	componentsStr := strings.Join(components, "\n")
+
+	// Build fields dynamically
+	fields := []DiscordEmbedField{
+		{
+			Name:   "Device",
+			Value:  deviceType,
+			Inline: true,
+		},
+		{
+			Name:   "Version",
+			Value:  version,
+			Inline: true,
+		},
+		{
+			Name:   "Build Type",
+			Value:  buildType,
+			Inline: true,
+		},
+		{
+			Name:   "Components Updated",
+			Value:  componentsStr,
+			Inline: false,
+		},
+		{
+			Name:   "OS Image Size",
+			Value:  osSizeStr,
+			Inline: true,
+		},
+	}
+
+	// Add OTA size field if provided
+	if otaSize > 0 {
+		otaSizeStr := fmt.Sprintf("%.2f MB", float64(otaSize)/(1024*1024))
+		fields = append(fields, DiscordEmbedField{
+			Name:   "OTA Update Size",
+			Value:  otaSizeStr,
+			Inline: true,
+		})
+	}
+
+	// Add total size
+	fields = append(fields, DiscordEmbedField{
+		Name:   "Total Size",
+		Value:  totalSizeStr,
+		Inline: true,
+	})
+
+	// Add status
+	fields = append(fields, DiscordEmbedField{
+		Name:   "Status",
+		Value:  "✅ Successfully Published",
+		Inline: false,
+	})
+
+	embed := DiscordEmbed{
+		Title:       fmt.Sprintf("New %s Build Published", buildType),
+		Description: fmt.Sprintf("WendyOS update for **%s** version **%s** has been published", deviceType, version),
+		Color:       color,
+		Fields:      fields,
+		Timestamp:   time.Now().Format(time.RFC3339),
+	}
+
+	payload := DiscordWebhookPayload{
+		Embeds: []DiscordEmbed{embed},
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Discord payload: %w", err)
+	}
+
+	// Create HTTP client with timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	resp, err := client.Post(discordWebhookURL, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to send Discord notification: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Discord API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	log.Info("Discord notification sent successfully")
+	return nil
+}
+
 // createStorageClientWithAuth creates a storage client and triggers authentication if needed
-func createStorageClientWithAuth(ctx context.Context) (*storage.Client, error) {
-	// Try to create the client
+func createStorageClientWithAuth(ctx context.Context, accessToken string) (*storage.Client, error) {
+	// If an access token is provided, use it directly
+	if accessToken != "" {
+		log.Info("Using provided access token for authentication")
+		tokenSource := oauth2.StaticTokenSource(&oauth2.Token{
+			AccessToken: accessToken,
+			TokenType:   "Bearer",
+		})
+		client, err := storage.NewClient(ctx, option.WithTokenSource(tokenSource))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create storage client with access token: %w", err)
+		}
+		return client, nil
+	}
+
+	// Try to create the client with default credentials
 	client, err := storage.NewClient(ctx)
 	if err != nil {
 		// Check if this is an authentication error
@@ -183,11 +624,14 @@ func main() {
 	deviceType := flag.String("device", "", "Device type (e.g., raspberry-pi-5)")
 	version := flag.String("version", "", "Version number (e.g., 1.0.0)")
 	localFile := flag.String("file", "", "Local file path to upload")
+	otaUpdateFile := flag.String("ota-update", "", "Local OTA update file path to upload")
 	updateOnly := flag.Bool("update-only", false, "Only update manifests without uploading")
 	listImages := flag.Bool("list", false, "List all images in the bucket")
 	createDevice := flag.Bool("create-device", false, "Create a new device type in the manifest")
 	nightly := flag.Bool("nightly", false, "Mark this build as a nightly/untested build")
 	stability := flag.String("stability", "stable", "Device stability level: stable, experimental, deprecated")
+	notifyDiscord := flag.Bool("notify-discord", true, "Send Discord notification after successful publish")
+	accessToken := flag.String("access-token", "", "GCS access token (from gcloud auth print-access-token)")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
@@ -218,15 +662,30 @@ func main() {
 			log.WithError(err).Fatal("Invalid stability")
 		}
 		if !*updateOnly {
-			if err := validateFileExists(*localFile); err != nil {
-				log.WithError(err).Fatal("Invalid file")
+			// At least one file (main or OTA) must be provided
+			if *localFile == "" && *otaUpdateFile == "" {
+				log.Fatal("At least one file must be provided: use --file for OS image or --ota-update for OTA update")
+			}
+
+			// Validate main file if provided
+			if *localFile != "" {
+				if err := validateFileExists(*localFile); err != nil {
+					log.WithError(err).Fatal("Invalid main file")
+				}
+			}
+
+			// Validate OTA update file if provided
+			if *otaUpdateFile != "" {
+				if err := validateFileExists(*otaUpdateFile); err != nil {
+					log.WithError(err).Fatal("Invalid OTA update file")
+				}
 			}
 		}
 	}
 
 	// Create context and storage client
 	ctx := context.Background()
-	client, err := createStorageClientWithAuth(ctx)
+	client, err := createStorageClientWithAuth(ctx, *accessToken)
 	if err != nil {
 		log.WithError(err).Fatal("Failed to create storage client")
 	}
@@ -242,28 +701,89 @@ func main() {
 
 	// Create device if requested
 	if *createDevice {
-		createNewDevice(ctx, bucket, *deviceType, *stability)
+		if err := createNewDevice(ctx, bucket, *deviceType, *stability); err != nil {
+			log.WithError(err).Fatal("Failed to create device")
+		}
 		return
 	}
 
 	// Process the request
 	if !*updateOnly {
-		// Upload the file
-		destinationPath := uploadFile(ctx, bucket, *localFile, *deviceType, *version)
-		if destinationPath == "" {
-			return // Error already logged
+		log.Info("Starting parallel file processing...")
+
+		// Process main file if provided
+		var mainFileChan <-chan fileProcessResult
+		if *localFile != "" {
+			log.Info("Processing main OS image...")
+			mainFileChan = processFileAsync(ctx, *localFile)
 		}
 
-		// Get file size after upload
-		obj := bucket.Object(destinationPath)
-		attrs, err := obj.Attrs(ctx)
-		if err != nil {
-			log.WithError(err).Error("Failed to get file attributes")
-			return
+		// Process OTA update file if provided
+		var otaUpdateFileChan <-chan fileProcessResult
+		if *otaUpdateFile != "" {
+			log.Info("Processing OTA update file...")
+			otaUpdateFileChan = processFileAsync(ctx, *otaUpdateFile)
 		}
 
-		// Update manifests
-		updateManifests(ctx, bucket, *deviceType, *version, destinationPath, attrs.Size, *nightly, *stability)
+		// Wait for main file processing
+		var mainResult fileProcessResult
+		if mainFileChan != nil {
+			mainResult = <-mainFileChan
+			if mainResult.err != nil {
+				log.WithError(mainResult.err).Fatal("Failed to process main file")
+			}
+			log.Info("Main file processed successfully")
+		}
+
+		// Wait for OTA update file processing
+		var otaUpdateResult fileProcessResult
+		if otaUpdateFileChan != nil {
+			otaUpdateResult = <-otaUpdateFileChan
+			if otaUpdateResult.err != nil {
+				log.WithError(otaUpdateResult.err).Fatal("Failed to process OTA update file")
+			}
+			log.Info("OTA update file processed successfully")
+		}
+
+		// Upload files in parallel
+		log.Info("Starting parallel uploads...")
+
+		var mainUploadChan <-chan uploadResult
+		if mainResult.compressedPath != "" {
+			mainUploadChan = uploadFileAsync(ctx, bucket, mainResult.compressedPath, *deviceType, *version)
+		}
+
+		var otaUpdateUploadChan <-chan uploadResult
+		if otaUpdateResult.compressedPath != "" {
+			otaUpdateUploadChan = uploadFileAsync(ctx, bucket, otaUpdateResult.compressedPath, *deviceType, *version)
+		}
+
+		// Wait for uploads to complete
+		var mainUpload uploadResult
+		if mainUploadChan != nil {
+			mainUpload = <-mainUploadChan
+			if mainUpload.err != nil {
+				log.WithError(mainUpload.err).Fatal("Failed to upload main file")
+			}
+			log.Info("Main file uploaded successfully")
+		}
+
+		var otaUpdateUpload uploadResult
+		if otaUpdateUploadChan != nil {
+			otaUpdateUpload = <-otaUpdateUploadChan
+			if otaUpdateUpload.err != nil {
+				log.WithError(otaUpdateUpload.err).Fatal("Failed to upload OTA update file")
+			}
+			log.Info("OTA update file uploaded successfully")
+		}
+
+		// Update manifests with results
+		updateManifests(
+			ctx, bucket, *deviceType, *version,
+			mainUpload.path, mainUpload.size, mainResult.checksum,
+			otaUpdateUpload.path, otaUpdateUpload.size, otaUpdateResult.checksum,
+			*nightly, *stability, *notifyDiscord,
+		)
 	} else {
 		// Just update manifests for existing file
 		imagePath := fmt.Sprintf("images/%s/%s/%s", *deviceType, *version, filepath.Base(*localFile))
@@ -275,7 +795,49 @@ func main() {
 			return
 		}
 
-		updateManifests(ctx, bucket, *deviceType, *version, imagePath, attrs.Size, *nightly, *stability)
+		// For update-only mode, preserve existing checksums from manifest
+		// Read existing manifest to get checksums
+		var mainChecksum string
+		var otaUpdateChecksum string
+
+		manifestPath := fmt.Sprintf("manifests/%s.json", *deviceType)
+		manifestObj := bucket.Object(manifestPath)
+		r, err := manifestObj.NewReader(ctx)
+		if err == nil {
+			defer r.Close()
+			var manifest DeviceManifest
+			content, readErr := io.ReadAll(r)
+			if readErr == nil && json.Unmarshal(content, &manifest) == nil {
+				if vm, exists := manifest.Versions[*version]; exists {
+					mainChecksum = vm.Checksum
+					otaUpdateChecksum = vm.OTAUpdateChecksum
+					log.WithFields(logrus.Fields{
+						"main_checksum": mainChecksum,
+						"ota_checksum":  otaUpdateChecksum,
+					}).Info("Preserving existing checksums from manifest")
+				} else {
+					log.Warn("Version doesn't exist in manifest - checksums will be empty")
+				}
+			}
+		} else {
+			log.WithError(err).Warn("Could not read manifest to preserve checksums")
+		}
+
+		// Handle existing OTA update file if specified
+		var otaUpdatePath string
+		var otaUpdateSize int64
+		if *otaUpdateFile != "" {
+			otaUpdatePath = fmt.Sprintf("images/%s/%s/%s", *deviceType, *version, filepath.Base(*otaUpdateFile))
+			menderObj := bucket.Object(otaUpdatePath)
+			menderAttrs, err := menderObj.Attrs(ctx)
+			if err != nil {
+				log.WithError(err).Error("Failed to get OTA update file attributes, does it exist?")
+				return
+			}
+			otaUpdateSize = menderAttrs.Size
+		}
+
+		updateManifests(ctx, bucket, *deviceType, *version, imagePath, attrs.Size, mainChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, *nightly, *stability, *notifyDiscord)
 	}
 }
 
@@ -335,7 +897,7 @@ func listImagesInBucket(ctx context.Context, bucket *storage.BucketHandle) {
 	}
 }
 
-func uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, deviceType, version string) string {
+func uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, deviceType, version string) (string, error) {
 	filename := filepath.Base(localPath)
 	destinationPath := fmt.Sprintf("images/%s/%s/%s", deviceType, version, filename)
 
@@ -348,16 +910,9 @@ func uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, de
 	file, err := os.Open(localPath)
 	if err != nil {
 		log.WithError(err).Error("Failed to open local file")
-		return ""
+		return "", fmt.Errorf("failed to open file %s: %w", localPath, err)
 	}
 	defer file.Close()
-
-	// Read file content
-	content, err := ioutil.ReadAll(file)
-	if err != nil {
-		log.WithError(err).Error("Failed to read local file")
-		return ""
-	}
 
 	// Create the destination object
 	obj := bucket.Object(destinationPath)
@@ -369,43 +924,230 @@ func uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, de
 		contentType = "application/zip"
 	} else if strings.HasSuffix(localPath, ".tgz") {
 		contentType = "application/gzip"
+	} else if strings.HasSuffix(localPath, ".xz") {
+		contentType = "application/x-xz"
+	} else if strings.HasSuffix(localPath, ".zst") {
+		contentType = "application/zstd"
 	}
 	w.ContentType = contentType
 
-	// Write the content
-	if _, err := w.Write(content); err != nil {
+	// Stream the content (efficient for large files)
+	if _, err := io.Copy(w, file); err != nil {
+		w.Close() // Close without checking error since write already failed
 		log.WithError(err).Error("Failed to write to GCS")
-		return ""
+		return "", fmt.Errorf("failed to write to GCS: %w", err)
 	}
 
-	// Close to commit the write
+	// Close to commit the write (MUST check error - this is when upload finalizes)
 	if err := w.Close(); err != nil {
 		log.WithError(err).Error("Failed to close GCS writer")
-		return ""
+		return "", fmt.Errorf("failed to finalize upload: %w", err)
 	}
 
 	log.WithField("path", destinationPath).Info("File uploaded successfully")
-	return destinationPath
+	return destinationPath, nil
 }
 
-func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, isNightly bool, stability string) {
+func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, fileChecksum string, otaUpdatePath string, otaUpdateSize int64, otaUpdateChecksum string, isNightly bool, stability string, notifyDiscord bool) {
 	logger := log.WithFields(logrus.Fields{
-		"device_type": deviceType,
-		"version":     version,
-		"file_path":   filePath,
-		"is_nightly":  isNightly,
-		"stability":   stability,
+		"device_type":     deviceType,
+		"version":         version,
+		"file_path":       filePath,
+		"ota_update_path": otaUpdatePath,
+		"is_nightly":      isNightly,
+		"stability":       stability,
+		"notify_discord":  notifyDiscord,
 	})
-	logger.Info("Updating manifests")
+	logger.Info("Updating manifests in parallel")
 
-	// Update device manifest
-	updateDeviceManifest(ctx, logger, bucket, deviceType, version, filePath, fileSize, isNightly)
+	// Update device and master manifests in parallel
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	// Update master manifest
-	updateMasterManifest(ctx, logger, bucket, deviceType, version, isNightly, stability)
+	// Create independent logger contexts for each goroutine to avoid races
+	// Copy all fields into separate maps before starting goroutines
+	deviceFields := logrus.Fields{
+		"device_type":     deviceType,
+		"version":         version,
+		"file_path":       filePath,
+		"ota_update_path": otaUpdatePath,
+		"is_nightly":      isNightly,
+		"stability":       stability,
+		"notify_discord":  notifyDiscord,
+		"manifest_type":   "device",
+	}
+	masterFields := logrus.Fields{
+		"device_type":    deviceType,
+		"version":        version,
+		"is_nightly":     isNightly,
+		"stability":      stability,
+		"notify_discord": notifyDiscord,
+		"manifest_type":  "master",
+	}
+
+	// Capture errors from goroutines
+	var deviceErr, masterErr error
+
+	go func() {
+		defer wg.Done()
+		deviceLogger := log.WithFields(deviceFields)
+		deviceErr = updateDeviceManifest(ctx, deviceLogger, bucket, deviceType, version, filePath, fileSize, fileChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, isNightly)
+	}()
+
+	go func() {
+		defer wg.Done()
+		masterLogger := log.WithFields(masterFields)
+		masterErr = updateMasterManifest(ctx, masterLogger, bucket, deviceType, version, isNightly, stability)
+	}()
+
+	wg.Wait()
+
+	// Check for errors - if either failed, exit with error
+	if deviceErr != nil {
+		logger.WithError(deviceErr).Fatal("Failed to update device manifest")
+	}
+	if masterErr != nil {
+		logger.WithError(masterErr).Fatal("Failed to update master manifest")
+	}
+
+	logger.Info("Manifests updated successfully")
+
+	// Verify the upload before sending notifications
+	logger.Info("Verifying upload integrity...")
+	if err := verifyUpload(ctx, logger, bucket, deviceType, version, filePath, fileChecksum, otaUpdatePath, otaUpdateChecksum); err != nil {
+		logger.WithError(err).Fatal("Upload verification failed - manifest may be corrupted")
+	}
+	logger.Info("Upload verification passed")
+
+	// Send Discord notification if requested
+	if notifyDiscord {
+		logger.Info("Sending Discord notification")
+		if err := sendDiscordNotification(deviceType, version, isNightly, fileSize, otaUpdateSize); err != nil {
+			logger.WithError(err).Warn("Failed to send Discord notification (update was still successful)")
+		}
+	}
 }
 
-func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, isNightly bool) {
+// verifyUpload reads back the manifest and verifies that the upload was successful
+func verifyUpload(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, expectedPath, expectedChecksum, expectedOTAPath, expectedOTAChecksum string) error {
+	logger.Info("Reading back device manifest for verification")
+
+	// Read back the device manifest
+	manifestPath := fmt.Sprintf("manifests/%s.json", deviceType)
+	obj := bucket.Object(manifestPath)
+	r, err := obj.NewReader(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read back manifest: %w", err)
+	}
+	defer r.Close()
+
+	content, err := io.ReadAll(r)
+	if err != nil {
+		return fmt.Errorf("failed to read manifest content: %w", err)
+	}
+
+	var manifest DeviceManifest
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		return fmt.Errorf("failed to parse manifest JSON: %w", err)
+	}
+
+	// Verify version exists in manifest
+	versionData, exists := manifest.Versions[version]
+	if !exists {
+		return fmt.Errorf("version %s not found in manifest after update", version)
+	}
+
+	logger.WithFields(logrus.Fields{
+		"version":            version,
+		"path_in_manifest":   versionData.Path,
+		"expected_path":      expectedPath,
+		"ota_path":           versionData.OTAUpdatePath,
+		"expected_ota_path":  expectedOTAPath,
+	}).Info("Verifying manifest contents")
+
+	// Verify OS image path if provided
+	if expectedPath != "" {
+		if versionData.Path != expectedPath {
+			return fmt.Errorf("OS image path mismatch: manifest has %q, expected %q", versionData.Path, expectedPath)
+		}
+
+		// Verify file exists at that path
+		fileObj := bucket.Object(versionData.Path)
+		attrs, err := fileObj.Attrs(ctx)
+		if err != nil {
+			return fmt.Errorf("OS image file not found at path %s: %w", versionData.Path, err)
+		}
+		logger.WithField("size", attrs.Size).Info("OS image file verified")
+
+		// Verify checksum if provided
+		if expectedChecksum != "" && versionData.Checksum != expectedChecksum {
+			return fmt.Errorf("OS image checksum mismatch: manifest has %q, expected %q", versionData.Checksum, expectedChecksum)
+		}
+	}
+
+	// Verify OTA update path if provided
+	if expectedOTAPath != "" {
+		if versionData.OTAUpdatePath != expectedOTAPath {
+			return fmt.Errorf("OTA update path mismatch: manifest has %q, expected %q", versionData.OTAUpdatePath, expectedOTAPath)
+		}
+
+		// Verify OTA file exists at that path
+		otaObj := bucket.Object(versionData.OTAUpdatePath)
+		attrs, err := otaObj.Attrs(ctx)
+		if err != nil {
+			return fmt.Errorf("OTA update file not found at path %s: %w", versionData.OTAUpdatePath, err)
+		}
+		logger.WithField("size", attrs.Size).Info("OTA update file verified")
+
+		// Verify OTA checksum if provided
+		if expectedOTAChecksum != "" && versionData.OTAUpdateChecksum != expectedOTAChecksum {
+			return fmt.Errorf("OTA update checksum mismatch: manifest has %q, expected %q", versionData.OTAUpdateChecksum, expectedOTAChecksum)
+		}
+	}
+
+	// Verify master manifest is updated
+	logger.Info("Verifying master manifest")
+	masterPath := "manifests/master.json"
+	masterObj := bucket.Object(masterPath)
+	masterReader, err := masterObj.NewReader(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read master manifest: %w", err)
+	}
+	defer masterReader.Close()
+
+	masterContent, err := io.ReadAll(masterReader)
+	if err != nil {
+		return fmt.Errorf("failed to read master manifest content: %w", err)
+	}
+
+	var masterManifest MasterManifest
+	if err := json.Unmarshal(masterContent, &masterManifest); err != nil {
+		return fmt.Errorf("failed to parse master manifest JSON: %w", err)
+	}
+
+	// Verify device exists in master manifest
+	deviceInfo, exists := masterManifest.Devices[deviceType]
+	if !exists {
+		return fmt.Errorf("device %s not found in master manifest", deviceType)
+	}
+
+	// Verify master manifest points to correct device manifest
+	expectedDeviceManifestPath := fmt.Sprintf("manifests/%s.json", deviceType)
+	if deviceInfo.ManifestPath != expectedDeviceManifestPath {
+		return fmt.Errorf("master manifest has wrong device manifest path: %q, expected %q", deviceInfo.ManifestPath, expectedDeviceManifestPath)
+	}
+
+	logger.WithFields(logrus.Fields{
+		"device":         deviceType,
+		"version":        version,
+		"latest":         deviceInfo.Latest,
+		"latest_nightly": deviceInfo.LatestNightly,
+	}).Info("Master manifest verified")
+
+	return nil
+}
+
+func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, fileChecksum string, otaUpdatePath string, otaUpdateSize int64, otaUpdateChecksum string, isNightly bool) error {
 	manifestPath := fmt.Sprintf("manifests/%s.json", deviceType)
 	logger = logger.WithField("manifest_path", manifestPath)
 	logger.Info("Processing device manifest")
@@ -420,16 +1162,16 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 		logger.Info("Reading existing device manifest")
 
 		// Read content
-		content, err := ioutil.ReadAll(r)
+		content, err := io.ReadAll(r)
 		if err != nil {
 			logger.WithError(err).Error("Failed to read existing device manifest")
-			return
+			return fmt.Errorf("failed to read existing device manifest: %w", err)
 		}
 
 		// Unmarshal JSON
 		if err := json.Unmarshal(content, &manifest); err != nil {
 			logger.WithError(err).Error("Failed to decode existing device manifest")
-			return
+			return fmt.Errorf("failed to decode existing device manifest: %w", err)
 		}
 
 		logger.WithField("version_count", len(manifest.Versions)).Info("Read existing manifest")
@@ -445,12 +1187,11 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 	// Check if version already exists with a different IsNightly flag
 	if existingVersion, exists := manifest.Versions[version]; exists {
 		if existingVersion.IsNightly != isNightly {
-			errMsg := fmt.Sprintf("version %s already exists as %s build, cannot change to %s build",
-				version,
-				map[bool]string{true: "nightly", false: "stable"}[existingVersion.IsNightly],
-				map[bool]string{true: "nightly", false: "stable"}[isNightly])
-			logger.Error(errMsg)
-			return
+			logger.WithFields(logrus.Fields{
+				"version":          version,
+				"existing_type":    map[bool]string{true: "nightly", false: "stable"}[existingVersion.IsNightly],
+				"requested_type":   map[bool]string{true: "nightly", false: "stable"}[isNightly],
+			}).Fatal("Cannot change build type for existing version - this would corrupt the manifest")
 		}
 		logger.WithField("version", version).Info("Version already exists, updating metadata")
 	}
@@ -477,36 +1218,75 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 	}
 
 	// Add or update this version and mark as latest
-	manifest.Versions[version] = VersionMetadata{
-		ReleaseDate: time.Now(),
-		Path:        filePath,
-		SizeBytes:   fileSize,
-		IsLatest:    true,
-		IsNightly:   isNightly,
+	// Start with existing metadata if version already exists, otherwise create new
+	versionMetadata, exists := manifest.Versions[version]
+	if !exists {
+		versionMetadata = VersionMetadata{}
+		logger.Info("Creating new version entry")
+	} else {
+		logger.Info("Updating existing version entry")
 	}
+
+	// Update release date
+	versionMetadata.ReleaseDate = time.Now()
+	versionMetadata.IsLatest = true
+	versionMetadata.IsNightly = isNightly
+
+	// Update OS image fields only if provided (filePath not empty)
+	if filePath != "" {
+		versionMetadata.Path = filePath
+		versionMetadata.Checksum = fileChecksum
+		versionMetadata.SizeBytes = fileSize
+		logger.WithFields(logrus.Fields{
+			"path":      filePath,
+			"size":      fileSize,
+			"checksum":  fileChecksum,
+		}).Info("Updating OS image metadata")
+	}
+
+	// Update OTA update fields only if provided
+	if otaUpdatePath != "" {
+		versionMetadata.OTAUpdatePath = otaUpdatePath
+		versionMetadata.OTAUpdateChecksum = otaUpdateChecksum
+		versionMetadata.OTAUpdateSizeBytes = otaUpdateSize
+		logger.WithFields(logrus.Fields{
+			"ota_path":     otaUpdatePath,
+			"ota_size":     otaUpdateSize,
+			"ota_checksum": otaUpdateChecksum,
+		}).Info("Updating OTA update metadata")
+	}
+
+	manifest.Versions[version] = versionMetadata
 
 	// Write back to bucket
 	logger.Info("Writing device manifest back to bucket")
 	w := obj.NewWriter(ctx)
-	defer w.Close()
 
 	// Marshal to JSON with indentation
 	content, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		logger.WithError(err).Error("Failed to marshal device manifest")
-		return
+		return fmt.Errorf("failed to marshal device manifest: %w", err)
 	}
 
 	// Write content
 	if _, err := w.Write(content); err != nil {
+		w.Close() // Close without checking error since write already failed
 		logger.WithError(err).Error("Failed to write device manifest")
-		return
+		return fmt.Errorf("failed to write device manifest: %w", err)
+	}
+
+	// Close to commit the write (MUST check error - this is when upload finalizes)
+	if err := w.Close(); err != nil {
+		logger.WithError(err).Error("Failed to finalize device manifest write")
+		return fmt.Errorf("failed to finalize device manifest write: %w", err)
 	}
 
 	logger.Info("Successfully wrote device manifest")
+	return nil
 }
 
-func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version string, isNightly bool, stability string) {
+func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version string, isNightly bool, stability string) error {
 	masterManifestPath := "manifests/master.json"
 	logger = logger.WithField("manifest_path", masterManifestPath)
 	logger.Info("Processing master manifest")
@@ -521,16 +1301,16 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 		logger.Info("Reading existing master manifest")
 
 		// Read content
-		content, err := ioutil.ReadAll(r)
+		content, err := io.ReadAll(r)
 		if err != nil {
 			logger.WithError(err).Error("Failed to read existing master manifest")
-			return
+			return fmt.Errorf("failed to read existing master manifest: %w", err)
 		}
 
 		// Unmarshal JSON
 		if err := json.Unmarshal(content, &masterManifest); err != nil {
 			logger.WithError(err).Error("Failed to decode existing master manifest")
-			return
+			return fmt.Errorf("failed to decode existing master manifest: %w", err)
 		}
 
 		logger.WithField("device_count", len(masterManifest.Devices)).Info("Read existing master manifest")
@@ -579,26 +1359,33 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 	// Write back to bucket
 	logger.Info("Writing master manifest back to bucket")
 	w := obj.NewWriter(ctx)
-	defer w.Close()
 
 	// Marshal to JSON with indentation
 	content, err := json.MarshalIndent(masterManifest, "", "  ")
 	if err != nil {
 		logger.WithError(err).Error("Failed to marshal master manifest")
-		return
+		return fmt.Errorf("failed to marshal master manifest: %w", err)
 	}
 
 	// Write content
 	if _, err := w.Write(content); err != nil {
+		w.Close() // Close without checking error since write already failed
 		logger.WithError(err).Error("Failed to write master manifest")
-		return
+		return fmt.Errorf("failed to write master manifest: %w", err)
+	}
+
+	// Close to commit the write (MUST check error - this is when upload finalizes)
+	if err := w.Close(); err != nil {
+		logger.WithError(err).Error("Failed to finalize master manifest write")
+		return fmt.Errorf("failed to finalize master manifest write: %w", err)
 	}
 
 	logger.Info("Successfully wrote master manifest")
+	return nil
 }
 
 // createNewDevice creates a new device type in both manifests
-func createNewDevice(ctx context.Context, bucket *storage.BucketHandle, deviceType string, stability string) {
+func createNewDevice(ctx context.Context, bucket *storage.BucketHandle, deviceType string, stability string) error {
 	logger := log.WithFields(logrus.Fields{
 		"device_type": deviceType,
 		"stability":   stability,
@@ -615,15 +1402,23 @@ func createNewDevice(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 	// Write device manifest
 	obj := bucket.Object(manifestPath)
 	w := obj.NewWriter(ctx)
-	defer w.Close()
 
 	content, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
-		logger.WithError(err).Fatal("Failed to marshal device manifest")
+		logger.WithError(err).Error("Failed to marshal device manifest")
+		return fmt.Errorf("failed to marshal device manifest: %w", err)
 	}
 
 	if _, err := w.Write(content); err != nil {
-		logger.WithError(err).Fatal("Failed to write device manifest")
+		w.Close() // Close without checking error since write already failed
+		logger.WithError(err).Error("Failed to write device manifest")
+		return fmt.Errorf("failed to write device manifest: %w", err)
+	}
+
+	// Close to commit the write (MUST check error - this is when upload finalizes)
+	if err := w.Close(); err != nil {
+		logger.WithError(err).Error("Failed to finalize device manifest write")
+		return fmt.Errorf("failed to finalize device manifest write: %w", err)
 	}
 
 	logger.Info("Successfully created device manifest")
@@ -636,13 +1431,15 @@ func createNewDevice(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 	r, err := masterObj.NewReader(ctx)
 	if err == nil {
 		defer r.Close()
-		content, err := ioutil.ReadAll(r)
+		content, err := io.ReadAll(r)
 		if err != nil {
-			logger.WithError(err).Fatal("Failed to read master manifest")
+			logger.WithError(err).Error("Failed to read master manifest")
+			return fmt.Errorf("failed to read master manifest: %w", err)
 		}
 
 		if err := json.Unmarshal(content, &masterManifest); err != nil {
-			logger.WithError(err).Fatal("Failed to decode master manifest")
+			logger.WithError(err).Error("Failed to decode master manifest")
+			return fmt.Errorf("failed to decode master manifest: %w", err)
 		}
 	} else {
 		masterManifest = MasterManifest{
@@ -666,16 +1463,25 @@ func createNewDevice(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 
 	// Write master manifest
 	w = masterObj.NewWriter(ctx)
-	defer w.Close()
 
 	content, err = json.MarshalIndent(masterManifest, "", "  ")
 	if err != nil {
-		logger.WithError(err).Fatal("Failed to marshal master manifest")
+		logger.WithError(err).Error("Failed to marshal master manifest")
+		return fmt.Errorf("failed to marshal master manifest: %w", err)
 	}
 
 	if _, err := w.Write(content); err != nil {
-		logger.WithError(err).Fatal("Failed to write master manifest")
+		w.Close() // Close without checking error since write already failed
+		logger.WithError(err).Error("Failed to write master manifest")
+		return fmt.Errorf("failed to write master manifest: %w", err)
+	}
+
+	// Close to commit the write (MUST check error - this is when upload finalizes)
+	if err := w.Close(); err != nil {
+		logger.WithError(err).Error("Failed to finalize master manifest write")
+		return fmt.Errorf("failed to finalize master manifest write: %w", err)
 	}
 
 	logger.Info("Successfully updated master manifest")
+	return nil
 }

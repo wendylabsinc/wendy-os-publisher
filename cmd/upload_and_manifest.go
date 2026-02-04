@@ -59,6 +59,9 @@ type VersionMetadata struct {
 	OTAUpdatePath        string    `json:"ota_update_path,omitempty"`
 	OTAUpdateChecksum    string    `json:"ota_update_checksum,omitempty"`
 	OTAUpdateSizeBytes   int64     `json:"ota_update_size_bytes,omitempty"`
+	RecoveryPath         string    `json:"recovery_path,omitempty"`
+	RecoveryChecksum     string    `json:"recovery_checksum,omitempty"`
+	RecoverySizeBytes    int64     `json:"recovery_size_bytes,omitempty"`
 }
 
 // MasterManifest represents the top-level manifest
@@ -625,6 +628,7 @@ func main() {
 	version := flag.String("version", "", "Version number (e.g., 1.0.0)")
 	localFile := flag.String("file", "", "Local file path to upload")
 	otaUpdateFile := flag.String("ota-update", "", "Local OTA update file path to upload")
+	recoveryFile := flag.String("recovery-file", "", "Optional recovery/tegraflash file path to upload")
 	updateOnly := flag.Bool("update-only", false, "Only update manifests without uploading")
 	listImages := flag.Bool("list", false, "List all images in the bucket")
 	createDevice := flag.Bool("create-device", false, "Create a new device type in the manifest")
@@ -662,9 +666,9 @@ func main() {
 			log.WithError(err).Fatal("Invalid stability")
 		}
 		if !*updateOnly {
-			// At least one file (main or OTA) must be provided
-			if *localFile == "" && *otaUpdateFile == "" {
-				log.Fatal("At least one file must be provided: use --file for OS image or --ota-update for OTA update")
+			// At least one file (main, OTA, or recovery) must be provided
+			if *localFile == "" && *otaUpdateFile == "" && *recoveryFile == "" {
+				log.Fatal("At least one file must be provided: use --file for OS image, --ota-update for OTA update, or --recovery-file for recovery file")
 			}
 
 			// Validate main file if provided
@@ -678,6 +682,13 @@ func main() {
 			if *otaUpdateFile != "" {
 				if err := validateFileExists(*otaUpdateFile); err != nil {
 					log.WithError(err).Fatal("Invalid OTA update file")
+				}
+			}
+
+			// Validate recovery file if provided
+			if *recoveryFile != "" {
+				if err := validateFileExists(*recoveryFile); err != nil {
+					log.WithError(err).Fatal("Invalid recovery file")
 				}
 			}
 		}
@@ -725,6 +736,13 @@ func main() {
 			otaUpdateFileChan = processFileAsync(ctx, *otaUpdateFile)
 		}
 
+		// Process recovery file if provided
+		var recoveryFileChan <-chan fileProcessResult
+		if *recoveryFile != "" {
+			log.Info("Processing recovery file...")
+			recoveryFileChan = processFileAsync(ctx, *recoveryFile)
+		}
+
 		// Wait for main file processing
 		var mainResult fileProcessResult
 		if mainFileChan != nil {
@@ -745,6 +763,16 @@ func main() {
 			log.Info("OTA update file processed successfully")
 		}
 
+		// Wait for recovery file processing
+		var recoveryResult fileProcessResult
+		if recoveryFileChan != nil {
+			recoveryResult = <-recoveryFileChan
+			if recoveryResult.err != nil {
+				log.WithError(recoveryResult.err).Fatal("Failed to process recovery file")
+			}
+			log.Info("Recovery file processed successfully")
+		}
+
 		// Upload files in parallel
 		log.Info("Starting parallel uploads...")
 
@@ -756,6 +784,11 @@ func main() {
 		var otaUpdateUploadChan <-chan uploadResult
 		if otaUpdateResult.compressedPath != "" {
 			otaUpdateUploadChan = uploadFileAsync(ctx, bucket, otaUpdateResult.compressedPath, *deviceType, *version)
+		}
+
+		var recoveryUploadChan <-chan uploadResult
+		if recoveryResult.compressedPath != "" {
+			recoveryUploadChan = uploadFileAsync(ctx, bucket, recoveryResult.compressedPath, *deviceType, *version)
 		}
 
 		// Wait for uploads to complete
@@ -777,11 +810,21 @@ func main() {
 			log.Info("OTA update file uploaded successfully")
 		}
 
+		var recoveryUpload uploadResult
+		if recoveryUploadChan != nil {
+			recoveryUpload = <-recoveryUploadChan
+			if recoveryUpload.err != nil {
+				log.WithError(recoveryUpload.err).Fatal("Failed to upload recovery file")
+			}
+			log.Info("Recovery file uploaded successfully")
+		}
+
 		// Update manifests with results
 		updateManifests(
 			ctx, bucket, *deviceType, *version,
 			mainUpload.path, mainUpload.size, mainResult.checksum,
 			otaUpdateUpload.path, otaUpdateUpload.size, otaUpdateResult.checksum,
+			recoveryUpload.path, recoveryUpload.size, recoveryResult.checksum,
 			*nightly, *stability, *notifyDiscord,
 		)
 	} else {
@@ -799,6 +842,7 @@ func main() {
 		// Read existing manifest to get checksums
 		var mainChecksum string
 		var otaUpdateChecksum string
+		var recoveryChecksum string
 
 		manifestPath := fmt.Sprintf("manifests/%s.json", *deviceType)
 		manifestObj := bucket.Object(manifestPath)
@@ -811,9 +855,11 @@ func main() {
 				if vm, exists := manifest.Versions[*version]; exists {
 					mainChecksum = vm.Checksum
 					otaUpdateChecksum = vm.OTAUpdateChecksum
+					recoveryChecksum = vm.RecoveryChecksum
 					log.WithFields(logrus.Fields{
-						"main_checksum": mainChecksum,
-						"ota_checksum":  otaUpdateChecksum,
+						"main_checksum":     mainChecksum,
+						"ota_checksum":      otaUpdateChecksum,
+						"recovery_checksum": recoveryChecksum,
 					}).Info("Preserving existing checksums from manifest")
 				} else {
 					log.Warn("Version doesn't exist in manifest - checksums will be empty")
@@ -837,7 +883,21 @@ func main() {
 			otaUpdateSize = menderAttrs.Size
 		}
 
-		updateManifests(ctx, bucket, *deviceType, *version, imagePath, attrs.Size, mainChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, *nightly, *stability, *notifyDiscord)
+		// Handle existing recovery file if specified
+		var recoveryPath string
+		var recoverySize int64
+		if *recoveryFile != "" {
+			recoveryPath = fmt.Sprintf("images/%s/%s/%s", *deviceType, *version, filepath.Base(*recoveryFile))
+			recoveryObj := bucket.Object(recoveryPath)
+			recoveryAttrs, err := recoveryObj.Attrs(ctx)
+			if err != nil {
+				log.WithError(err).Error("Failed to get recovery file attributes, does it exist?")
+				return
+			}
+			recoverySize = recoveryAttrs.Size
+		}
+
+		updateManifests(ctx, bucket, *deviceType, *version, imagePath, attrs.Size, mainChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, *nightly, *stability, *notifyDiscord)
 	}
 }
 
@@ -948,12 +1008,13 @@ func uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, de
 	return destinationPath, nil
 }
 
-func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, fileChecksum string, otaUpdatePath string, otaUpdateSize int64, otaUpdateChecksum string, isNightly bool, stability string, notifyDiscord bool) {
+func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, fileChecksum string, otaUpdatePath string, otaUpdateSize int64, otaUpdateChecksum string, recoveryPath string, recoverySize int64, recoveryChecksum string, isNightly bool, stability string, notifyDiscord bool) {
 	logger := log.WithFields(logrus.Fields{
 		"device_type":     deviceType,
 		"version":         version,
 		"file_path":       filePath,
 		"ota_update_path": otaUpdatePath,
+		"recovery_path":   recoveryPath,
 		"is_nightly":      isNightly,
 		"stability":       stability,
 		"notify_discord":  notifyDiscord,
@@ -971,6 +1032,7 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 		"version":         version,
 		"file_path":       filePath,
 		"ota_update_path": otaUpdatePath,
+		"recovery_path":   recoveryPath,
 		"is_nightly":      isNightly,
 		"stability":       stability,
 		"notify_discord":  notifyDiscord,
@@ -991,7 +1053,7 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 	go func() {
 		defer wg.Done()
 		deviceLogger := log.WithFields(deviceFields)
-		deviceErr = updateDeviceManifest(ctx, deviceLogger, bucket, deviceType, version, filePath, fileSize, fileChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, isNightly)
+		deviceErr = updateDeviceManifest(ctx, deviceLogger, bucket, deviceType, version, filePath, fileSize, fileChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, isNightly)
 	}()
 
 	go func() {
@@ -1014,7 +1076,7 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 
 	// Verify the upload before sending notifications
 	logger.Info("Verifying upload integrity...")
-	if err := verifyUpload(ctx, logger, bucket, deviceType, version, filePath, fileChecksum, otaUpdatePath, otaUpdateChecksum); err != nil {
+	if err := verifyUpload(ctx, logger, bucket, deviceType, version, filePath, fileChecksum, otaUpdatePath, otaUpdateChecksum, recoveryPath, recoveryChecksum); err != nil {
 		logger.WithError(err).Fatal("Upload verification failed - manifest may be corrupted")
 	}
 	logger.Info("Upload verification passed")
@@ -1029,7 +1091,7 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 }
 
 // verifyUpload reads back the manifest and verifies that the upload was successful
-func verifyUpload(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, expectedPath, expectedChecksum, expectedOTAPath, expectedOTAChecksum string) error {
+func verifyUpload(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, expectedPath, expectedChecksum, expectedOTAPath, expectedOTAChecksum, expectedRecoveryPath, expectedRecoveryChecksum string) error {
 	logger.Info("Reading back device manifest for verification")
 
 	// Read back the device manifest
@@ -1058,11 +1120,13 @@ func verifyUpload(ctx context.Context, logger *logrus.Entry, bucket *storage.Buc
 	}
 
 	logger.WithFields(logrus.Fields{
-		"version":            version,
-		"path_in_manifest":   versionData.Path,
-		"expected_path":      expectedPath,
-		"ota_path":           versionData.OTAUpdatePath,
-		"expected_ota_path":  expectedOTAPath,
+		"version":                version,
+		"path_in_manifest":       versionData.Path,
+		"expected_path":          expectedPath,
+		"ota_path":               versionData.OTAUpdatePath,
+		"expected_ota_path":      expectedOTAPath,
+		"recovery_path":          versionData.RecoveryPath,
+		"expected_recovery_path": expectedRecoveryPath,
 	}).Info("Verifying manifest contents")
 
 	// Verify OS image path if provided
@@ -1102,6 +1166,26 @@ func verifyUpload(ctx context.Context, logger *logrus.Entry, bucket *storage.Buc
 		// Verify OTA checksum if provided
 		if expectedOTAChecksum != "" && versionData.OTAUpdateChecksum != expectedOTAChecksum {
 			return fmt.Errorf("OTA update checksum mismatch: manifest has %q, expected %q", versionData.OTAUpdateChecksum, expectedOTAChecksum)
+		}
+	}
+
+	// Verify recovery file path if provided
+	if expectedRecoveryPath != "" {
+		if versionData.RecoveryPath != expectedRecoveryPath {
+			return fmt.Errorf("recovery file path mismatch: manifest has %q, expected %q", versionData.RecoveryPath, expectedRecoveryPath)
+		}
+
+		// Verify recovery file exists at that path
+		recoveryObj := bucket.Object(versionData.RecoveryPath)
+		attrs, err := recoveryObj.Attrs(ctx)
+		if err != nil {
+			return fmt.Errorf("recovery file not found at path %s: %w", versionData.RecoveryPath, err)
+		}
+		logger.WithField("size", attrs.Size).Info("Recovery file verified")
+
+		// Verify recovery checksum if provided
+		if expectedRecoveryChecksum != "" && versionData.RecoveryChecksum != expectedRecoveryChecksum {
+			return fmt.Errorf("recovery file checksum mismatch: manifest has %q, expected %q", versionData.RecoveryChecksum, expectedRecoveryChecksum)
 		}
 	}
 
@@ -1147,7 +1231,7 @@ func verifyUpload(ctx context.Context, logger *logrus.Entry, bucket *storage.Buc
 	return nil
 }
 
-func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, fileChecksum string, otaUpdatePath string, otaUpdateSize int64, otaUpdateChecksum string, isNightly bool) error {
+func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, fileChecksum string, otaUpdatePath string, otaUpdateSize int64, otaUpdateChecksum string, recoveryPath string, recoverySize int64, recoveryChecksum string, isNightly bool) error {
 	manifestPath := fmt.Sprintf("manifests/%s.json", deviceType)
 	logger = logger.WithField("manifest_path", manifestPath)
 	logger.Info("Processing device manifest")
@@ -1254,6 +1338,18 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 			"ota_size":     otaUpdateSize,
 			"ota_checksum": otaUpdateChecksum,
 		}).Info("Updating OTA update metadata")
+	}
+
+	// Update recovery fields only if provided
+	if recoveryPath != "" {
+		versionMetadata.RecoveryPath = recoveryPath
+		versionMetadata.RecoveryChecksum = recoveryChecksum
+		versionMetadata.RecoverySizeBytes = recoverySize
+		logger.WithFields(logrus.Fields{
+			"recovery_path":     recoveryPath,
+			"recovery_size":     recoverySize,
+			"recovery_checksum": recoveryChecksum,
+		}).Info("Updating recovery file metadata")
 	}
 
 	manifest.Versions[version] = versionMetadata

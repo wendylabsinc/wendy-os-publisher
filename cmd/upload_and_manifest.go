@@ -350,30 +350,69 @@ func compressFile(ctx context.Context, inputPath string) (string, error) {
 
 	var cmd *exec.Cmd
 	var outFile *os.File // Declare at function scope for proper cleanup
+	var cmdAlreadyStarted bool // Track if cmd.Start() was already called
+	var pvCommand *exec.Cmd // For cleanup when using pv pipeline
 
 	if isOTA {
 		// Use xz for OTA files (maximum compression)
 		// Check if pv is available for progress
-		pvCmd := exec.Command("which", "pv")
-		hasPv := pvCmd.Run() == nil
+		pvCheckCmd := exec.Command("which", "pv")
+		hasPv := pvCheckCmd.Run() == nil
 
 		if hasPv {
-			// Use pv for progress indication: pv input.mender | xz -9e > output.xz
+			// Use pv for progress indication with proper piping (no shell)
 			log.Info("Using pv for progress indication")
-			cmd = exec.Command("sh", "-c", fmt.Sprintf("pv '%s' | xz -9e > '%s'", inputPath, outputPath))
-			cmd.Stdout = os.Stdout
+
+			// Create the pv command
+			pvCommand = exec.CommandContext(ctx, "pv", inputPath)
+
+			// Create the xz command
+			xzCommand := exec.CommandContext(ctx, "xz", "-9e")
+
+			// Set up pipe: pv stdout -> xz stdin
+			var err error
+			xzCommand.Stdin, err = pvCommand.StdoutPipe()
+			if err != nil {
+				return "", fmt.Errorf("failed to create pipe: %w", err)
+			}
+
+			// Create output file for xz
+			outFile, err = os.Create(outputPath)
+			if err != nil {
+				return "", fmt.Errorf("failed to create output file: %w", err)
+			}
+
+			// Connect xz stdout to output file
+			xzCommand.Stdout = outFile
+			xzCommand.Stderr = os.Stderr
+			pvCommand.Stderr = os.Stderr
+
+			// Start both commands
+			if err := xzCommand.Start(); err != nil {
+				outFile.Close()
+				return "", fmt.Errorf("failed to start xz: %w", err)
+			}
+			if err := pvCommand.Start(); err != nil {
+				xzCommand.Process.Kill()
+				outFile.Close()
+				return "", fmt.Errorf("failed to start pv: %w", err)
+			}
+
+			// Use xz command as the main cmd for Wait() below
+			cmd = xzCommand
+			cmdAlreadyStarted = true
 		} else {
 			// Fallback to xz with verbose mode
 			log.Info("pv not found, using xz verbose mode")
-			cmd = exec.Command("xz", "-9e", "-v", "-k", "-c", inputPath)
+			cmd = exec.CommandContext(ctx, "xz", "-9e", "-v", "-k", "-c", inputPath)
 			var err error
 			outFile, err = os.Create(outputPath)
 			if err != nil {
 				return "", fmt.Errorf("failed to create output file: %w", err)
 			}
 			cmd.Stdout = outFile
+			cmd.Stderr = os.Stderr
 		}
-		cmd.Stderr = os.Stderr
 	} else {
 		// Use zip for OS images
 		// zip -9 -q creates a .zip file with maximum compression
@@ -397,9 +436,11 @@ func compressFile(ctx context.Context, inputPath string) (string, error) {
 		}
 	}()
 
-	// Start the compression process
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("failed to start compression: %w", err)
+	// Start the compression process (already started if using pv pipeline)
+	if !cmdAlreadyStarted {
+		if err := cmd.Start(); err != nil {
+			return "", fmt.Errorf("failed to start compression: %w", err)
+		}
 	}
 
 	// Wait for completion or cancellation
@@ -410,18 +451,33 @@ func compressFile(ctx context.Context, inputPath string) (string, error) {
 
 	select {
 	case <-ctx.Done():
-		// Context cancelled, kill the process
+		// Context cancelled, kill the processes
 		if cmd.Process != nil {
 			cmd.Process.Kill()
-			// Give process time to release file handles
-			time.Sleep(100 * time.Millisecond)
 		}
+		if pvCommand != nil && pvCommand.Process != nil {
+			pvCommand.Process.Kill()
+		}
+		// Wait for goroutine to complete to avoid leak
+		<-done
+		// Also wait for pv if it's running
+		if pvCommand != nil {
+			pvCommand.Wait()
+		}
+		// Give process time to release file handles
+		time.Sleep(100 * time.Millisecond)
 		// Clean up partial file, ignore error if file doesn't exist
 		if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
 			log.WithError(err).Warn("Failed to clean up partial compressed file")
 		}
 		return "", ctx.Err()
 	case err := <-done:
+		// Also wait for pv if it's running
+		if pvCommand != nil {
+			if pvErr := pvCommand.Wait(); pvErr != nil {
+				log.WithError(pvErr).Warn("pv command failed")
+			}
+		}
 		if err != nil {
 			// Clean up partial file on failure
 			if rmErr := os.Remove(outputPath); rmErr != nil && !os.IsNotExist(rmErr) {
@@ -437,6 +493,11 @@ func compressFile(ctx context.Context, inputPath string) (string, error) {
 		return "", fmt.Errorf("compressed file not found: %w", err)
 	}
 
+	// Protect against division by zero
+	if fileSize == 0 {
+		return "", fmt.Errorf("original file has zero size")
+	}
+
 	compressionRatio := float64(fileSize-compressedInfo.Size()) / float64(fileSize) * 100
 
 	log.WithFields(logrus.Fields{
@@ -449,7 +510,7 @@ func compressFile(ctx context.Context, inputPath string) (string, error) {
 }
 
 // sendDiscordNotification sends a notification to Discord about the update
-func sendDiscordNotification(deviceType, version string, isNightly bool, osSize int64, otaSize int64) error {
+func sendDiscordNotification(deviceType, version string, isNightly bool, osSize int64, otaSize int64, recoverySize int64) error {
 	buildType := "Stable"
 	color := colorStable
 	if isNightly {
@@ -465,12 +526,18 @@ func sendDiscordNotification(deviceType, version string, isNightly bool, osSize 
 	if otaSize > 0 {
 		totalSize += otaSize
 	}
+	if recoverySize > 0 {
+		totalSize += recoverySize
+	}
 	totalSizeStr := fmt.Sprintf("%.2f MB", float64(totalSize)/(1024*1024))
 
 	// Build components list
 	components := []string{"📦 OS Image"}
 	if otaSize > 0 {
 		components = append(components, "🔄 OTA Update")
+	}
+	if recoverySize > 0 {
+		components = append(components, "🔧 Recovery File")
 	}
 	componentsStr := strings.Join(components, "\n")
 
@@ -509,6 +576,16 @@ func sendDiscordNotification(deviceType, version string, isNightly bool, osSize 
 		fields = append(fields, DiscordEmbedField{
 			Name:   "OTA Update Size",
 			Value:  otaSizeStr,
+			Inline: true,
+		})
+	}
+
+	// Add Recovery size field if provided
+	if recoverySize > 0 {
+		recoverySizeStr := fmt.Sprintf("%.2f MB", float64(recoverySize)/(1024*1024))
+		fields = append(fields, DiscordEmbedField{
+			Name:   "Recovery File Size",
+			Value:  recoverySizeStr,
 			Inline: true,
 		})
 	}
@@ -694,8 +771,11 @@ func main() {
 		}
 	}
 
-	// Create context and storage client
-	ctx := context.Background()
+	// Create context with timeout and storage client
+	// 30 minute timeout should be sufficient for most uploads
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
 	client, err := createStorageClientWithAuth(ctx, *accessToken)
 	if err != nil {
 		log.WithError(err).Fatal("Failed to create storage client")
@@ -1084,7 +1164,7 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 	// Send Discord notification if requested
 	if notifyDiscord {
 		logger.Info("Sending Discord notification")
-		if err := sendDiscordNotification(deviceType, version, isNightly, fileSize, otaUpdateSize); err != nil {
+		if err := sendDiscordNotification(deviceType, version, isNightly, fileSize, otaUpdateSize, recoverySize); err != nil {
 			logger.WithError(err).Warn("Failed to send Discord notification (update was still successful)")
 		}
 	}
@@ -1103,7 +1183,9 @@ func verifyUpload(ctx context.Context, logger *logrus.Entry, bucket *storage.Buc
 	}
 	defer r.Close()
 
-	content, err := io.ReadAll(r)
+	// Limit manifest read size to 10MB to prevent DoS
+	limitedReader := io.LimitReader(r, 10*1024*1024)
+	content, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return fmt.Errorf("failed to read manifest content: %w", err)
 	}
@@ -1245,8 +1327,9 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 		defer r.Close()
 		logger.Info("Reading existing device manifest")
 
-		// Read content
-		content, err := io.ReadAll(r)
+		// Read content with size limit to prevent DoS
+		limitedReader := io.LimitReader(r, 10*1024*1024) // 10MB limit
+		content, err := io.ReadAll(limitedReader)
 		if err != nil {
 			logger.WithError(err).Error("Failed to read existing device manifest")
 			return fmt.Errorf("failed to read existing device manifest: %w", err)
@@ -1352,6 +1435,12 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 		}).Info("Updating recovery file metadata")
 	}
 
+	// Validate that at least one file is provided
+	if filePath == "" && otaUpdatePath == "" && recoveryPath == "" {
+		logger.Error("Cannot create version entry with no files")
+		return fmt.Errorf("cannot create version entry with no files - at least one of OS image, OTA update, or recovery file must be provided")
+	}
+
 	manifest.Versions[version] = versionMetadata
 
 	// Write back to bucket
@@ -1396,8 +1485,9 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 		defer r.Close()
 		logger.Info("Reading existing master manifest")
 
-		// Read content
-		content, err := io.ReadAll(r)
+		// Read content with size limit to prevent DoS
+		limitedReader := io.LimitReader(r, 10*1024*1024) // 10MB limit
+		content, err := io.ReadAll(limitedReader)
 		if err != nil {
 			logger.WithError(err).Error("Failed to read existing master manifest")
 			return fmt.Errorf("failed to read existing master manifest: %w", err)

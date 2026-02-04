@@ -421,7 +421,7 @@ func compressFile(ctx context.Context, inputPath string, fileType string) (strin
 		}
 
 		// Check if pv is available for progress
-		pvCheckCmd := exec.Command("which", "pv")
+		pvCheckCmd := exec.CommandContext(ctx, "which", "pv")
 		hasPv := pvCheckCmd.Run() == nil
 
 		if hasPv {
@@ -459,6 +459,7 @@ func compressFile(ctx context.Context, inputPath string, fileType string) (strin
 			}
 			if err := pvCommand.Start(); err != nil {
 				xzCommand.Process.Kill()
+				xzCommand.Wait() // Wait to reap the zombie process
 				outFile.Close()
 				return "", fmt.Errorf("failed to start pv: %w", err)
 			}
@@ -487,7 +488,7 @@ func compressFile(ctx context.Context, inputPath string, fileType string) (strin
 		filename := filepath.Base(inputPath)
 		zipFilename := filename + ".zip"
 
-		cmd = exec.Command("zip", "-6", zipFilename, filename)
+		cmd = exec.CommandContext(ctx, "zip", "-6", zipFilename, filename)
 		cmd.Dir = dir
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -702,7 +703,12 @@ func sendDiscordNotification(deviceType, version string, isNightly bool, osSize 
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		// Limit response body read to prevent DoS
+		limitedBody := io.LimitReader(resp.Body, 1024*1024) // 1MB limit
+		body, readErr := io.ReadAll(limitedBody)
+		if readErr != nil {
+			return fmt.Errorf("Discord API returned status %d (could not read body: %w)", resp.StatusCode, readErr)
+		}
 		return fmt.Errorf("Discord API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -999,7 +1005,9 @@ func main() {
 		if err == nil {
 			defer r.Close()
 			var manifest DeviceManifest
-			content, readErr := io.ReadAll(r)
+			// Limit manifest read size to prevent DoS
+			limitedReader := io.LimitReader(r, 10*1024*1024) // 10MB limit
+			content, readErr := io.ReadAll(limitedReader)
 			if readErr == nil && json.Unmarshal(content, &manifest) == nil {
 				if vm, exists := manifest.Versions[*version]; exists {
 					mainChecksum = vm.Checksum
@@ -1196,28 +1204,31 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 		"manifest_type":  "master",
 	}
 
-	// Capture errors from goroutines
-	var deviceErr, masterErr error
+	// Use channels to capture errors safely (no race condition)
+	deviceErrChan := make(chan error, 1)
+	masterErrChan := make(chan error, 1)
 
 	go func() {
 		defer wg.Done()
 		deviceLogger := log.WithFields(deviceFields)
-		deviceErr = updateDeviceManifest(ctx, deviceLogger, bucket, deviceType, version, filePath, fileSize, fileChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, isNightly)
+		deviceErrChan <- updateDeviceManifest(ctx, deviceLogger, bucket, deviceType, version, filePath, fileSize, fileChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, isNightly)
 	}()
 
 	go func() {
 		defer wg.Done()
 		masterLogger := log.WithFields(masterFields)
-		masterErr = updateMasterManifest(ctx, masterLogger, bucket, deviceType, version, isNightly, stability)
+		masterErrChan <- updateMasterManifest(ctx, masterLogger, bucket, deviceType, version, isNightly, stability)
 	}()
 
 	wg.Wait()
+	close(deviceErrChan)
+	close(masterErrChan)
 
 	// Check for errors - if either failed, exit with error
-	if deviceErr != nil {
+	if deviceErr := <-deviceErrChan; deviceErr != nil {
 		logger.WithError(deviceErr).Fatal("Failed to update device manifest")
 	}
-	if masterErr != nil {
+	if masterErr := <-masterErrChan; masterErr != nil {
 		logger.WithError(masterErr).Fatal("Failed to update master manifest")
 	}
 
@@ -1350,7 +1361,9 @@ func verifyUpload(ctx context.Context, logger *logrus.Entry, bucket *storage.Buc
 	}
 	defer masterReader.Close()
 
-	masterContent, err := io.ReadAll(masterReader)
+	// Limit master manifest read size to prevent DoS
+	limitedMasterReader := io.LimitReader(masterReader, 10*1024*1024) // 10MB limit
+	masterContent, err := io.ReadAll(limitedMasterReader)
 	if err != nil {
 		return fmt.Errorf("failed to read master manifest content: %w", err)
 	}

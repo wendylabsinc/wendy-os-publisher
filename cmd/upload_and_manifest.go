@@ -192,7 +192,8 @@ type fileProcessResult struct {
 }
 
 // processFileAsync compresses and calculates checksum concurrently
-func processFileAsync(ctx context.Context, filePath string) <-chan fileProcessResult {
+// fileType: "os" (from --file), "ota" (from --ota-update), "recovery" (from --recovery-file)
+func processFileAsync(ctx context.Context, filePath string, fileType string) <-chan fileProcessResult {
 	resultChan := make(chan fileProcessResult, 1)
 
 	go func() {
@@ -207,7 +208,7 @@ func processFileAsync(ctx context.Context, filePath string) <-chan fileProcessRe
 		}
 
 		// Compress file if needed
-		compressedPath, err := compressFile(ctx, filePath)
+		compressedPath, err := compressFile(ctx, filePath, fileType)
 		if err != nil {
 			resultChan <- fileProcessResult{err: fmt.Errorf("compression failed: %w", err)}
 			return
@@ -296,9 +297,35 @@ func calculateChecksum(filePath string) (string, error) {
 	return checksum, nil
 }
 
-// compressFile compresses a file using xz with maximum compression
+// isAlreadyCompressed checks if a file is already compressed based on its extension
+func isAlreadyCompressed(filename string) bool {
+	// Get the full extension (handles .tar.gz, .tar.xz, etc.)
+	lowerName := strings.ToLower(filename)
+
+	// Common compressed formats
+	compressedExts := []string{
+		".xz", ".gz", ".bz2", ".zst", ".lz4", ".lzma",
+		".tar.gz", ".tgz", ".tar.xz", ".tar.zst", ".tar.bz2",
+		".zip", ".7z", ".rar",
+	}
+
+	for _, ext := range compressedExts {
+		if strings.HasSuffix(lowerName, ext) {
+			log.WithFields(logrus.Fields{
+				"filename":  filename,
+				"extension": ext,
+			}).Info("File is already compressed, skipping compression")
+			return true
+		}
+	}
+
+	return false
+}
+
+// compressFile compresses a file based on its type and compression strategy
+// fileType: "os" (OS images from --file), "ota" (OTA updates from --ota-update), "recovery" (recovery files from --recovery-file)
 // Returns the path to the compressed file, or the original path if compression not needed
-func compressFile(ctx context.Context, inputPath string) (string, error) {
+func compressFile(ctx context.Context, inputPath string, fileType string) (string, error) {
 	// Check for cancellation before starting
 	select {
 	case <-ctx.Done():
@@ -306,10 +333,43 @@ func compressFile(ctx context.Context, inputPath string) (string, error) {
 	default:
 	}
 
+	// Skip compression if file is already compressed
+	if isAlreadyCompressed(inputPath) {
+		return inputPath, nil
+	}
+
 	ext := strings.ToLower(filepath.Ext(inputPath))
 
-	// Only compress .img and .mender (OTA update) files
-	if ext != ".img" && ext != ".mender" {
+	// Determine if file should be compressed based on extension and type
+	shouldCompress := false
+	compressionMethod := ""
+
+	switch ext {
+	case ".img":
+		// Raw disk images should be compressed
+		shouldCompress = true
+		if fileType == "ota" {
+			compressionMethod = "xz-max" // Maximum compression for OTA
+		} else if fileType == "recovery" {
+			compressionMethod = "xz-fast" // Fast compression for recovery (frequently accessed)
+		} else {
+			compressionMethod = "zip" // Standard zip for OS images (widely compatible)
+		}
+	case ".mender":
+		// Mender OTA files should always use maximum compression
+		shouldCompress = true
+		compressionMethod = "xz-max"
+	default:
+		// Other file types - don't compress
+		log.WithFields(logrus.Fields{
+			"path": inputPath,
+			"ext":  ext,
+			"type": fileType,
+		}).Info("File type doesn't need compression, using as-is")
+		return inputPath, nil
+	}
+
+	if !shouldCompress {
 		log.WithField("path", inputPath).Info("File doesn't need compression, using as-is")
 		return inputPath, nil
 	}
@@ -321,18 +381,15 @@ func compressFile(ctx context.Context, inputPath string) (string, error) {
 	}
 	fileSize := fileInfo.Size()
 
-	// Determine compression method based on file type
-	// OTA files (.mender) use xz, OS images (.img) use zip
-	isOTA := ext == ".mender"
+	// Determine output path based on compression method
 	var outputPath string
-	var compressionMethod string
-
-	if isOTA {
+	switch compressionMethod {
+	case "xz-max", "xz-fast":
 		outputPath = inputPath + ".xz"
-		compressionMethod = "xz -9e"
-	} else {
+	case "zip":
 		outputPath = inputPath + ".zip"
-		compressionMethod = "zip -9"
+	default:
+		return "", fmt.Errorf("unknown compression method: %s", compressionMethod)
 	}
 
 	// Check if compressed file already exists
@@ -342,10 +399,11 @@ func compressFile(ctx context.Context, inputPath string) (string, error) {
 	}
 
 	log.WithFields(logrus.Fields{
-		"input":  inputPath,
-		"output": outputPath,
-		"size":   fileSize,
-		"method": compressionMethod,
+		"input":     inputPath,
+		"output":    outputPath,
+		"size":      fileSize,
+		"method":    compressionMethod,
+		"file_type": fileType,
 	}).Info("Compressing file...")
 
 	var cmd *exec.Cmd
@@ -353,8 +411,15 @@ func compressFile(ctx context.Context, inputPath string) (string, error) {
 	var cmdAlreadyStarted bool // Track if cmd.Start() was already called
 	var pvCommand *exec.Cmd // For cleanup when using pv pipeline
 
-	if isOTA {
-		// Use xz for OTA files (maximum compression)
+	// Handle different compression methods
+	switch compressionMethod {
+	case "xz-max", "xz-fast":
+		// Use xz compression (with or without pv for progress)
+		xzFlags := "-9e" // Maximum compression by default
+		if compressionMethod == "xz-fast" {
+			xzFlags = "-1" // Fast compression for recovery files
+		}
+
 		// Check if pv is available for progress
 		pvCheckCmd := exec.Command("which", "pv")
 		hasPv := pvCheckCmd.Run() == nil
@@ -366,8 +431,8 @@ func compressFile(ctx context.Context, inputPath string) (string, error) {
 			// Create the pv command
 			pvCommand = exec.CommandContext(ctx, "pv", inputPath)
 
-			// Create the xz command
-			xzCommand := exec.CommandContext(ctx, "xz", "-9e")
+			// Create the xz command with appropriate flags
+			xzCommand := exec.CommandContext(ctx, "xz", xzFlags)
 
 			// Set up pipe: pv stdout -> xz stdin
 			var err error
@@ -402,9 +467,9 @@ func compressFile(ctx context.Context, inputPath string) (string, error) {
 			cmd = xzCommand
 			cmdAlreadyStarted = true
 		} else {
-			// Fallback to xz with verbose mode
+			// Fallback to xz with verbose mode (no pv)
 			log.Info("pv not found, using xz verbose mode")
-			cmd = exec.CommandContext(ctx, "xz", "-9e", "-v", "-k", "-c", inputPath)
+			cmd = exec.CommandContext(ctx, "xz", xzFlags, "-v", "-k", "-c", inputPath)
 			var err error
 			outFile, err = os.Create(outputPath)
 			if err != nil {
@@ -413,18 +478,22 @@ func compressFile(ctx context.Context, inputPath string) (string, error) {
 			cmd.Stdout = outFile
 			cmd.Stderr = os.Stderr
 		}
-	} else {
+
+	case "zip":
 		// Use zip for OS images
-		// zip -9 -q creates a .zip file with maximum compression
+		// zip -6 creates a .zip file with balanced compression (faster than -9)
 		// We need to change to the directory and zip from there to avoid including full paths
 		dir := filepath.Dir(inputPath)
 		filename := filepath.Base(inputPath)
 		zipFilename := filename + ".zip"
 
-		cmd = exec.Command("zip", "-9", zipFilename, filename)
+		cmd = exec.Command("zip", "-6", zipFilename, filename)
 		cmd.Dir = dir
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
+
+	default:
+		return "", fmt.Errorf("unsupported compression method: %s", compressionMethod)
 	}
 
 	// Ensure outFile is closed when function returns
@@ -806,21 +875,21 @@ func main() {
 		var mainFileChan <-chan fileProcessResult
 		if *localFile != "" {
 			log.Info("Processing main OS image...")
-			mainFileChan = processFileAsync(ctx, *localFile)
+			mainFileChan = processFileAsync(ctx, *localFile, "os")
 		}
 
 		// Process OTA update file if provided
 		var otaUpdateFileChan <-chan fileProcessResult
 		if *otaUpdateFile != "" {
 			log.Info("Processing OTA update file...")
-			otaUpdateFileChan = processFileAsync(ctx, *otaUpdateFile)
+			otaUpdateFileChan = processFileAsync(ctx, *otaUpdateFile, "ota")
 		}
 
 		// Process recovery file if provided
 		var recoveryFileChan <-chan fileProcessResult
 		if *recoveryFile != "" {
 			log.Info("Processing recovery file...")
-			recoveryFileChan = processFileAsync(ctx, *recoveryFile)
+			recoveryFileChan = processFileAsync(ctx, *recoveryFile, "recovery")
 		}
 
 		// Wait for main file processing

@@ -380,7 +380,7 @@ func TestCompressFileNonCompressible(t *testing.T) {
 	tmpFile.Close()
 
 	// Should return original path
-	result, err := compressFile(context.Background(), tmpFile.Name())
+	result, err := compressFile(context.Background(), tmpFile.Name(), "os")
 	if err != nil {
 		t.Fatalf("compressFile() error = %v", err)
 	}
@@ -411,8 +411,8 @@ func TestCompressAndChecksumIntegration(t *testing.T) {
 		t.Skip("xz not available, skipping compression test")
 	}
 
-	// Compress
-	compressed, err := compressFile(context.Background(), tmpFile.Name())
+	// Compress (test as OS image type)
+	compressed, err := compressFile(context.Background(), tmpFile.Name(), "os")
 	if err != nil {
 		t.Fatalf("compressFile() error = %v", err)
 	}

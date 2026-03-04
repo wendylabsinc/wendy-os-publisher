@@ -858,10 +858,6 @@ func main() {
 		log.SetLevel(logrus.DebugLevel)
 	}
 
-	// Note: showProgress is parsed but currently progress is always shown
-	// Can be used in the future to conditionally disable progress
-	_ = showProgress
-
 	// Validate args
 	if *listImages {
 		// No other args needed for listing
@@ -929,12 +925,6 @@ func main() {
 					log.WithError(err).Fatal("Invalid recovery file")
 				}
 			}
-			// Validate recovery file if provided
-			if *recoveryFile != "" {
-				if err := validateFileExists(*recoveryFile); err != nil {
-					log.WithError(err).Fatal("Invalid recovery file")
-				}
-			}
 		}
 	}
 
@@ -962,18 +952,6 @@ func main() {
 		if err := createNewDevice(ctx, bucket, *deviceType, *stability); err != nil {
 			log.WithError(err).Fatal("Failed to create device")
 		}
-		return
-	}
-
-	// Promote nightly to stable if requested
-	if *promote {
-		promoteNightlyToStable(ctx, bucket, *deviceType, *version)
-		return
-	}
-
-	// Swap image file if requested
-	if *swap {
-		swapImageFile(ctx, bucket, *deviceType, *version, *localFile, *recoveryFile, *nightly)
 		return
 	}
 
@@ -1604,18 +1582,6 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 			}
 		}
 		logger.WithField("version", version).Info("Setting version as latest stable")
-	}
-
-	// Calculate checksum for main image file
-	logger.Info("Calculating checksum for main image file")
-	imageChecksum := calculateFileChecksum(ctx, bucket, filePath, logger)
-
-	// Calculate checksum for recovery file if provided
-	var recoveryChecksum *string
-	if recoveryPath != nil {
-		logger.Info("Calculating checksum for recovery file")
-		checksumValue := calculateFileChecksum(ctx, bucket, *recoveryPath, logger)
-		recoveryChecksum = &checksumValue
 	}
 
 	// Add or update this version and mark as latest

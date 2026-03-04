@@ -82,6 +82,63 @@ type DeviceLatestInfo struct {
 	Stability     string `json:"stability,omitempty"` // "stable", "experimental", "deprecated"
 }
 
+// ProgressReader wraps an io.Reader and reports progress
+type ProgressReader struct {
+	reader      io.Reader
+	total       int64
+	read        int64
+	lastPercent int
+	callback    func(read int64, total int64, percent int)
+}
+
+// NewProgressReader creates a new progress tracking reader
+func NewProgressReader(r io.Reader, total int64, callback func(int64, int64, int)) *ProgressReader {
+	return &ProgressReader{
+		reader:   r,
+		total:    total,
+		callback: callback,
+	}
+}
+
+// Read implements io.Reader interface
+func (pr *ProgressReader) Read(p []byte) (int, error) {
+	n, err := pr.reader.Read(p)
+	pr.read += int64(n)
+
+	// Calculate percentage
+	percent := int(float64(pr.read) / float64(pr.total) * 100)
+
+	// Only report if percentage changed (avoid spam)
+	if percent != pr.lastPercent {
+		pr.lastPercent = percent
+		if pr.callback != nil {
+			pr.callback(pr.read, pr.total, percent)
+		}
+	}
+
+	return n, err
+}
+
+// printProgress displays upload progress to stdout
+func printProgress(read int64, total int64, percent int) {
+	// Convert to human-readable format
+	readMB := float64(read) / (1024 * 1024)
+	totalMB := float64(total) / (1024 * 1024)
+
+	// Create progress bar (50 chars wide)
+	barWidth := 50
+	filled := int(float64(barWidth) * float64(percent) / 100)
+	bar := strings.Repeat("=", filled) + strings.Repeat("-", barWidth-filled)
+
+	// Print with carriage return to overwrite previous line
+	fmt.Printf("\rUploading: [%s] %d%% (%.2f MB / %.2f MB)", bar, percent, readMB, totalMB)
+
+	// Add newline when complete
+	if percent >= 100 {
+		fmt.Println()
+	}
+}
+
 // isOSImage checks if a file is an OS image based on its extension
 func isOSImage(filename string) bool {
 	ext := strings.ToLower(filepath.Ext(filename))
@@ -801,6 +858,10 @@ func main() {
 		log.SetLevel(logrus.DebugLevel)
 	}
 
+	// Note: showProgress is parsed but currently progress is always shown
+	// Can be used in the future to conditionally disable progress
+	_ = showProgress
+
 	// Validate args
 	if *listImages {
 		// No other args needed for listing
@@ -868,6 +929,12 @@ func main() {
 					log.WithError(err).Fatal("Invalid recovery file")
 				}
 			}
+			// Validate recovery file if provided
+			if *recoveryFile != "" {
+				if err := validateFileExists(*recoveryFile); err != nil {
+					log.WithError(err).Fatal("Invalid recovery file")
+				}
+			}
 		}
 	}
 
@@ -895,6 +962,18 @@ func main() {
 		if err := createNewDevice(ctx, bucket, *deviceType, *stability); err != nil {
 			log.WithError(err).Fatal("Failed to create device")
 		}
+		return
+	}
+
+	// Promote nightly to stable if requested
+	if *promote {
+		promoteNightlyToStable(ctx, bucket, *deviceType, *version)
+		return
+	}
+
+	// Swap image file if requested
+	if *swap {
+		swapImageFile(ctx, bucket, *deviceType, *version, *localFile, *recoveryFile, *nightly)
 		return
 	}
 
@@ -1194,6 +1273,7 @@ func uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, de
 
 	// Close to commit the write (MUST check error - this is when upload finalizes)
 	if err := w.Close(); err != nil {
+		fmt.Println() // Clear the progress line
 		log.WithError(err).Error("Failed to close GCS writer")
 		return "", fmt.Errorf("failed to finalize upload: %w", err)
 	}
@@ -1524,6 +1604,18 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 			}
 		}
 		logger.WithField("version", version).Info("Setting version as latest stable")
+	}
+
+	// Calculate checksum for main image file
+	logger.Info("Calculating checksum for main image file")
+	imageChecksum := calculateFileChecksum(ctx, bucket, filePath, logger)
+
+	// Calculate checksum for recovery file if provided
+	var recoveryChecksum *string
+	if recoveryPath != nil {
+		logger.Info("Calculating checksum for recovery file")
+		checksumValue := calculateFileChecksum(ctx, bucket, *recoveryPath, logger)
+		recoveryChecksum = &checksumValue
 	}
 
 	// Add or update this version and mark as latest

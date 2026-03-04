@@ -49,19 +49,23 @@ type DeviceManifest struct {
 
 // VersionMetadata contains metadata about a specific OS version
 type VersionMetadata struct {
-	ReleaseDate          time.Time `json:"release_date"`
-	Path                 string    `json:"path"`
-	Checksum             string    `json:"checksum,omitempty"`
-	SizeBytes            int64     `json:"size_bytes"`
-	Changelog            string    `json:"changelog,omitempty"`
-	IsLatest             bool      `json:"is_latest"`
-	IsNightly            bool      `json:"is_nightly,omitempty"`
-	OTAUpdatePath        string    `json:"ota_update_path,omitempty"`
-	OTAUpdateChecksum    string    `json:"ota_update_checksum,omitempty"`
-	OTAUpdateSizeBytes   int64     `json:"ota_update_size_bytes,omitempty"`
-	RecoveryPath         string    `json:"recovery_path,omitempty"`
-	RecoveryChecksum     string    `json:"recovery_checksum,omitempty"`
-	RecoverySizeBytes    int64     `json:"recovery_size_bytes,omitempty"`
+	ReleaseDate        time.Time  `json:"release_date"`
+	Path               string     `json:"path"`
+	Checksum           string     `json:"checksum,omitempty"`
+	SizeBytes          int64      `json:"size_bytes"`
+	Changelog          string     `json:"changelog,omitempty"`
+	IsLatest           bool       `json:"is_latest"`
+	IsNightly          bool       `json:"is_nightly,omitempty"`
+	PromotedFrom       *string    `json:"promoted_from,omitempty"`
+	PromotedAt         *time.Time `json:"promoted_at,omitempty"`
+	SwappedAt          *time.Time `json:"swapped_at,omitempty"`
+	SwapCount          *int       `json:"swap_count,omitempty"`
+	OTAUpdatePath      string     `json:"ota_update_path,omitempty"`
+	OTAUpdateChecksum  string     `json:"ota_update_checksum,omitempty"`
+	OTAUpdateSizeBytes int64      `json:"ota_update_size_bytes,omitempty"`
+	RecoveryPath       string     `json:"recovery_path,omitempty"`
+	RecoveryChecksum   string     `json:"recovery_checksum,omitempty"`
+	RecoverySizeBytes  int64      `json:"recovery_size_bytes,omitempty"`
 }
 
 // MasterManifest represents the top-level manifest
@@ -789,6 +793,8 @@ func main() {
 	notifyDiscord := flag.Bool("notify-discord", true, "Send Discord notification after successful publish")
 	accessToken := flag.String("access-token", "", "GCS access token (from gcloud auth print-access-token)")
 	debug := flag.Bool("debug", false, "Enable debug logging")
+	promote := flag.Bool("promote", false, "Promote nightly to stable by removing 'nightly' from version name")
+	swap := flag.Bool("swap", false, "Replace existing version's image file while preserving metadata")
 	flag.Parse()
 
 	if *debug {
@@ -805,6 +811,25 @@ func main() {
 		}
 		if err := validateStability(*stability); err != nil {
 			log.WithError(err).Fatal("Invalid stability")
+		}
+	} else if *promote {
+		// For promotion, we need device type and version
+		if err := validateDeviceType(*deviceType); err != nil {
+			log.WithError(err).Fatal("Invalid device type")
+		}
+		if err := validateVersion(*version); err != nil {
+			log.WithError(err).Fatal("Invalid source version")
+		}
+	} else if *swap {
+		// For swap, we need device type, version, and file
+		if err := validateDeviceType(*deviceType); err != nil {
+			log.WithError(err).Fatal("Invalid device type")
+		}
+		if err := validateVersion(*version); err != nil {
+			log.WithError(err).Fatal("Invalid version")
+		}
+		if err := validateFileExists(*localFile); err != nil {
+			log.WithError(err).Fatal("Invalid file")
 		}
 	} else {
 		// For normal operations, we need device type and version
@@ -870,6 +895,18 @@ func main() {
 		if err := createNewDevice(ctx, bucket, *deviceType, *stability); err != nil {
 			log.WithError(err).Fatal("Failed to create device")
 		}
+		return
+	}
+
+	// Promote nightly to stable if requested
+	if *promote {
+		promoteNightlyToStable(ctx, bucket, *deviceType, *version)
+		return
+	}
+
+	// Swap image file if requested
+	if *swap {
+		swapImageFile(ctx, bucket, *deviceType, *version, *localFile, *recoveryFile, *nightly)
 		return
 	}
 
@@ -1775,4 +1812,480 @@ func createNewDevice(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 
 	logger.Info("Successfully updated master manifest")
 	return nil
+}
+
+// promoteNightlyToStable promotes a nightly build to stable release by removing "nightly" from version name
+func promoteNightlyToStable(ctx context.Context, bucket *storage.BucketHandle, deviceType, nightlyVersion string) {
+	logger := log.WithFields(logrus.Fields{
+		"device_type":     deviceType,
+		"nightly_version": nightlyVersion,
+		"operation":       "promote",
+	})
+	logger.Info("Promoting nightly build to stable")
+
+	// Transform version name (remove "nightly-" prefix or "-nightly" suffix)
+	stableVersion := nightlyVersion
+	if strings.HasPrefix(stableVersion, "nightly-") {
+		stableVersion = strings.TrimPrefix(stableVersion, "nightly-")
+	} else if strings.HasSuffix(stableVersion, "-nightly") {
+		stableVersion = strings.TrimSuffix(stableVersion, "-nightly")
+	} else if stableVersion == "nightly" {
+		logger.Fatal("Cannot promote version 'nightly' - must have additional version info (e.g., 'nightly-2025-12-20')")
+	} else if !strings.Contains(strings.ToLower(stableVersion), "nightly") {
+		logger.Fatal("Version does not contain 'nightly' - cannot determine stable version name")
+	}
+
+	logger.WithField("stable_version", stableVersion).Info("Derived stable version name")
+
+	// Read device manifest
+	manifestPath := fmt.Sprintf("manifests/%s.json", deviceType)
+	obj := bucket.Object(manifestPath)
+
+	var manifest DeviceManifest
+	r, err := obj.NewReader(ctx)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to read device manifest - does the device exist?")
+	}
+	defer r.Close()
+
+	content, err := io.ReadAll(r)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to read manifest content")
+	}
+
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		logger.WithError(err).Fatal("Failed to parse device manifest")
+	}
+
+	// Validate source version exists and is nightly
+	sourceVersionMeta, exists := manifest.Versions[nightlyVersion]
+	if !exists {
+		logger.Fatal("Source version does not exist in manifest")
+	}
+
+	if !sourceVersionMeta.IsNightly {
+		logger.Fatal("Source version is not a nightly build - cannot promote")
+	}
+
+	// Validate target version doesn't already exist
+	if _, exists := manifest.Versions[stableVersion]; exists {
+		logger.WithField("stable_version", stableVersion).Fatal("Target stable version already exists")
+	}
+
+	// Get source file path and parse to create destination path
+	sourcePath := sourceVersionMeta.Path
+	parts := strings.Split(sourcePath, "/")
+	if len(parts) < 4 {
+		logger.WithField("path", sourcePath).Fatal("Invalid source file path format")
+	}
+	filename := parts[len(parts)-1]
+	destinationPath := fmt.Sprintf("images/%s/%s/%s", deviceType, stableVersion, filename)
+
+	logger.WithFields(logrus.Fields{
+		"source_path":      sourcePath,
+		"destination_path": destinationPath,
+	}).Info("Copying file to stable path")
+
+	// Copy GCS file to new stable path using server-side copy
+	srcObj := bucket.Object(sourcePath)
+	dstObj := bucket.Object(destinationPath)
+	copier := dstObj.CopierFrom(srcObj)
+
+	attrs, err := copier.Run(ctx)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to copy file to stable path")
+	}
+
+	logger.WithField("size_bytes", attrs.Size).Info("File copied successfully")
+
+	// Copy OTA update file if it exists
+	var otaDestPath string
+	if sourceVersionMeta.OTAUpdatePath != "" {
+		otaParts := strings.Split(sourceVersionMeta.OTAUpdatePath, "/")
+		if len(otaParts) >= 4 {
+			otaFilename := otaParts[len(otaParts)-1]
+			otaDestPath = fmt.Sprintf("images/%s/%s/%s", deviceType, stableVersion, otaFilename)
+
+			otaSrcObj := bucket.Object(sourceVersionMeta.OTAUpdatePath)
+			otaDstObj := bucket.Object(otaDestPath)
+			otaCopier := otaDstObj.CopierFrom(otaSrcObj)
+
+			if _, err := otaCopier.Run(ctx); err != nil {
+				logger.WithError(err).Warn("Failed to copy OTA update file, continuing without it")
+				otaDestPath = ""
+			} else {
+				logger.Info("OTA update file copied successfully")
+			}
+		}
+	}
+
+	// Copy recovery file if it exists
+	var recoveryDestPath string
+	if sourceVersionMeta.RecoveryPath != "" {
+		recoveryParts := strings.Split(sourceVersionMeta.RecoveryPath, "/")
+		if len(recoveryParts) >= 4 {
+			recoveryFilename := recoveryParts[len(recoveryParts)-1]
+			recoveryDestPath = fmt.Sprintf("images/%s/%s/%s", deviceType, stableVersion, recoveryFilename)
+
+			recoverySrcObj := bucket.Object(sourceVersionMeta.RecoveryPath)
+			recoveryDstObj := bucket.Object(recoveryDestPath)
+			recoveryCopier := recoveryDstObj.CopierFrom(recoverySrcObj)
+
+			if _, err := recoveryCopier.Run(ctx); err != nil {
+				logger.WithError(err).Warn("Failed to copy recovery file, continuing without it")
+				recoveryDestPath = ""
+			} else {
+				logger.Info("Recovery file copied successfully")
+			}
+		}
+	}
+
+	// Create new stable version entry with promotion metadata
+	promotedAt := time.Now()
+	sourceVersion := nightlyVersion
+	stableVersionMeta := VersionMetadata{
+		ReleaseDate:        sourceVersionMeta.ReleaseDate,
+		Path:               destinationPath,
+		Checksum:           sourceVersionMeta.Checksum,
+		SizeBytes:          sourceVersionMeta.SizeBytes,
+		Changelog:          sourceVersionMeta.Changelog,
+		IsLatest:           true,
+		IsNightly:          false,
+		PromotedFrom:       &sourceVersion,
+		PromotedAt:         &promotedAt,
+		OTAUpdatePath:      otaDestPath,
+		OTAUpdateChecksum:  sourceVersionMeta.OTAUpdateChecksum,
+		OTAUpdateSizeBytes: sourceVersionMeta.OTAUpdateSizeBytes,
+		RecoveryPath:       recoveryDestPath,
+		RecoveryChecksum:   sourceVersionMeta.RecoveryChecksum,
+		RecoverySizeBytes:  sourceVersionMeta.RecoverySizeBytes,
+	}
+
+	// Clear OTA/recovery fields if copy failed
+	if otaDestPath == "" {
+		stableVersionMeta.OTAUpdateChecksum = ""
+		stableVersionMeta.OTAUpdateSizeBytes = 0
+	}
+	if recoveryDestPath == "" {
+		stableVersionMeta.RecoveryChecksum = ""
+		stableVersionMeta.RecoverySizeBytes = 0
+	}
+
+	// Update IsLatest flags - clear all stable versions
+	for k, v := range manifest.Versions {
+		if !v.IsNightly {
+			v.IsLatest = false
+			manifest.Versions[k] = v
+		}
+	}
+
+	// Add new stable version
+	manifest.Versions[stableVersion] = stableVersionMeta
+
+	// Write device manifest back
+	logger.Info("Writing updated device manifest")
+	w := obj.NewWriter(ctx)
+
+	manifestContent, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to marshal device manifest")
+	}
+
+	if _, err := w.Write(manifestContent); err != nil {
+		w.Close()
+		logger.WithError(err).Fatal("Failed to write device manifest")
+	}
+
+	if err := w.Close(); err != nil {
+		logger.WithError(err).Fatal("Failed to finalize device manifest write")
+	}
+
+	logger.Info("Successfully updated device manifest")
+
+	// Update master manifest
+	updateMasterManifestForPromotion(ctx, logger, bucket, deviceType, stableVersion)
+
+	logger.WithField("stable_version", stableVersion).Info("Successfully promoted nightly to stable")
+}
+
+// updateMasterManifestForPromotion updates master manifest after promotion
+func updateMasterManifestForPromotion(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, stableVersion string) {
+	masterManifestPath := "manifests/master.json"
+	obj := bucket.Object(masterManifestPath)
+
+	var masterManifest MasterManifest
+	r, err := obj.NewReader(ctx)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to read master manifest")
+	}
+	defer r.Close()
+
+	content, err := io.ReadAll(r)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to read master manifest content")
+	}
+
+	if err := json.Unmarshal(content, &masterManifest); err != nil {
+		logger.WithError(err).Fatal("Failed to decode master manifest")
+	}
+
+	masterManifest.LastUpdated = time.Now()
+
+	deviceInfo, exists := masterManifest.Devices[deviceType]
+	if !exists {
+		logger.Fatal("Device does not exist in master manifest")
+	}
+
+	deviceInfo.Latest = stableVersion
+	masterManifest.Devices[deviceType] = deviceInfo
+
+	w := obj.NewWriter(ctx)
+
+	manifestContent, err := json.MarshalIndent(masterManifest, "", "  ")
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to marshal master manifest")
+	}
+
+	if _, err := w.Write(manifestContent); err != nil {
+		w.Close()
+		logger.WithError(err).Fatal("Failed to write master manifest")
+	}
+
+	if err := w.Close(); err != nil {
+		logger.WithError(err).Fatal("Failed to finalize master manifest write")
+	}
+
+	logger.Info("Successfully updated master manifest")
+}
+
+// swapImageFile replaces an existing version's image file while preserving metadata
+func swapImageFile(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, localFile, recoveryFile string, isNightly bool) {
+	logger := log.WithFields(logrus.Fields{
+		"device_type":   deviceType,
+		"version":       version,
+		"local_file":    localFile,
+		"recovery_file": recoveryFile,
+		"is_nightly":    isNightly,
+		"operation":     "swap",
+	})
+	logger.Info("Starting image file swap")
+
+	// Read device manifest to validate version exists
+	manifestPath := fmt.Sprintf("manifests/%s.json", deviceType)
+	obj := bucket.Object(manifestPath)
+
+	var manifest DeviceManifest
+	r, err := obj.NewReader(ctx)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to read device manifest - does the device exist?")
+	}
+	defer r.Close()
+
+	content, err := io.ReadAll(r)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to read manifest content")
+	}
+
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		logger.WithError(err).Fatal("Failed to parse device manifest")
+	}
+
+	// Validate version exists
+	existingVersion, exists := manifest.Versions[version]
+	if !exists {
+		logger.WithField("version", version).Fatal("Cannot swap - version does not exist. Use normal upload to create new version.")
+	}
+
+	// Verify IsNightly flag matches
+	if existingVersion.IsNightly != isNightly {
+		logger.WithFields(logrus.Fields{
+			"existing_is_nightly":  existingVersion.IsNightly,
+			"requested_is_nightly": isNightly,
+		}).Fatal("Cannot swap - IsNightly flag mismatch. Version is " +
+			map[bool]string{true: "nightly", false: "stable"}[existingVersion.IsNightly] +
+			" but --nightly flag is " +
+			map[bool]string{true: "set", false: "not set"}[isNightly])
+	}
+
+	// Upload new file
+	newPath, err := uploadFile(ctx, bucket, localFile, deviceType, version)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to upload new file")
+	}
+
+	// Warn if filename changed
+	oldFilename := filepath.Base(existingVersion.Path)
+	newFilename := filepath.Base(localFile)
+	if newFilename != oldFilename {
+		logger.WithFields(logrus.Fields{
+			"old_filename": oldFilename,
+			"new_filename": newFilename,
+		}).Warn("Filename changed during swap - old file will be orphaned")
+	}
+
+	// Get uploaded file size
+	destObj := bucket.Object(newPath)
+	attrs, err := destObj.Attrs(ctx)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to get uploaded file attributes")
+	}
+
+	// Calculate checksum of uploaded file
+	logger.Info("Calculating checksum of uploaded file")
+	checksum, err := calculateGCSChecksum(ctx, bucket, newPath)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to calculate checksum")
+	}
+
+	// Handle recovery file swap if provided
+	var newRecoveryPath, newRecoveryChecksum string
+	var newRecoverySize int64
+	if recoveryFile != "" {
+		recoveryPath, err := uploadFile(ctx, bucket, recoveryFile, deviceType, version)
+		if err != nil {
+			logger.WithError(err).Fatal("Failed to upload recovery file")
+		}
+		newRecoveryPath = recoveryPath
+
+		recoveryObj := bucket.Object(recoveryPath)
+		recoveryAttrs, err := recoveryObj.Attrs(ctx)
+		if err != nil {
+			logger.WithError(err).Fatal("Failed to get recovery file attributes")
+		}
+		newRecoverySize = recoveryAttrs.Size
+
+		recoveryCS, err := calculateGCSChecksum(ctx, bucket, recoveryPath)
+		if err != nil {
+			logger.WithError(err).Fatal("Failed to calculate recovery checksum")
+		}
+		newRecoveryChecksum = recoveryCS
+	}
+
+	// Build updated metadata preserving historical fields
+	swapCount := 1
+	if existingVersion.SwapCount != nil {
+		swapCount = *existingVersion.SwapCount + 1
+	}
+	swappedAt := time.Now()
+
+	updatedVersion := VersionMetadata{
+		// Preserved fields
+		ReleaseDate:  existingVersion.ReleaseDate,
+		Changelog:    existingVersion.Changelog,
+		IsLatest:     existingVersion.IsLatest,
+		IsNightly:    existingVersion.IsNightly,
+		PromotedFrom: existingVersion.PromotedFrom,
+		PromotedAt:   existingVersion.PromotedAt,
+
+		// Updated fields
+		Path:      newPath,
+		SizeBytes: attrs.Size,
+		Checksum:  checksum,
+		SwappedAt: &swappedAt,
+		SwapCount: &swapCount,
+
+		// OTA preserved from existing
+		OTAUpdatePath:      existingVersion.OTAUpdatePath,
+		OTAUpdateChecksum:  existingVersion.OTAUpdateChecksum,
+		OTAUpdateSizeBytes: existingVersion.OTAUpdateSizeBytes,
+	}
+
+	// Recovery: use new if provided, otherwise preserve existing
+	if recoveryFile != "" {
+		updatedVersion.RecoveryPath = newRecoveryPath
+		updatedVersion.RecoveryChecksum = newRecoveryChecksum
+		updatedVersion.RecoverySizeBytes = newRecoverySize
+	} else {
+		updatedVersion.RecoveryPath = existingVersion.RecoveryPath
+		updatedVersion.RecoveryChecksum = existingVersion.RecoveryChecksum
+		updatedVersion.RecoverySizeBytes = existingVersion.RecoverySizeBytes
+	}
+
+	// Write updated manifest
+	manifest.Versions[version] = updatedVersion
+
+	w := obj.NewWriter(ctx)
+
+	manifestContent, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to marshal device manifest")
+	}
+
+	if _, err := w.Write(manifestContent); err != nil {
+		w.Close()
+		logger.WithError(err).Fatal("Failed to write device manifest")
+	}
+
+	if err := w.Close(); err != nil {
+		logger.WithError(err).Fatal("Failed to finalize device manifest write")
+	}
+
+	// Update master manifest timestamp only
+	updateMasterManifestTimestamp(ctx, logger, bucket)
+
+	logger.WithFields(logrus.Fields{
+		"version":      version,
+		"new_path":     newPath,
+		"new_checksum": checksum,
+		"swap_count":   swapCount,
+	}).Info("Successfully swapped image file")
+}
+
+// calculateGCSChecksum calculates SHA256 checksum of a file in GCS
+func calculateGCSChecksum(ctx context.Context, bucket *storage.BucketHandle, filePath string) (string, error) {
+	obj := bucket.Object(filePath)
+	r, err := obj.NewReader(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to read file for checksum: %w", err)
+	}
+	defer r.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, r); err != nil {
+		return "", fmt.Errorf("failed to calculate checksum: %w", err)
+	}
+
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+// updateMasterManifestTimestamp updates only the timestamp in master manifest
+func updateMasterManifestTimestamp(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle) {
+	masterManifestPath := "manifests/master.json"
+	obj := bucket.Object(masterManifestPath)
+
+	var masterManifest MasterManifest
+	r, err := obj.NewReader(ctx)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to read master manifest")
+	}
+	defer r.Close()
+
+	content, err := io.ReadAll(r)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to read master manifest content")
+	}
+
+	if err := json.Unmarshal(content, &masterManifest); err != nil {
+		logger.WithError(err).Fatal("Failed to decode master manifest")
+	}
+
+	masterManifest.LastUpdated = time.Now()
+
+	w := obj.NewWriter(ctx)
+
+	manifestContent, err := json.MarshalIndent(masterManifest, "", "  ")
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to marshal master manifest")
+	}
+
+	if _, err := w.Write(manifestContent); err != nil {
+		w.Close()
+		logger.WithError(err).Fatal("Failed to write master manifest")
+	}
+
+	if err := w.Close(); err != nil {
+		logger.WithError(err).Fatal("Failed to finalize master manifest write")
+	}
+
+	logger.Info("Updated master manifest timestamp")
 }

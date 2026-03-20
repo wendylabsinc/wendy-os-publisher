@@ -164,7 +164,7 @@ func printProgress(read int64, total int64, percent int) {
 // isOSImage checks if a file is an OS image based on its extension
 func isOSImage(filename string) bool {
 	ext := strings.ToLower(filepath.Ext(filename))
-	result := ext == ".img" || ext == ".zip" || ext == ".tgz" || ext == ".xz" || ext == ".zst" || ext == ".mender"
+	result := ext == ".img" || ext == ".wic" || ext == ".zip" || ext == ".tgz" || ext == ".xz" || ext == ".zst" || ext == ".mender"
 	log.WithFields(logrus.Fields{
 		"filename":  filename,
 		"extension": ext,
@@ -428,7 +428,7 @@ func compressFile(ctx context.Context, inputPath string, fileType string) (strin
 	compressionMethod := ""
 
 	switch ext {
-	case ".img":
+	case ".img", ".wic":
 		// Raw disk images should be compressed
 		shouldCompress = true
 		if fileType == "ota" {
@@ -876,6 +876,9 @@ func main() {
 	swap := flag.Bool("swap", false, "Replace existing version's image file while preserving metadata")
 	firmware := flag.Bool("firmware", false, "Upload firmware (.bin) instead of OS image")
 	chip := flag.String("chip", "", "Chip type for firmware upload (e.g., esp32-s3)")
+	removeDevice := flag.Bool("remove-device", false, "Remove a device (or firmware chip with --firmware) and all its images/versions")
+	removeKeepFiles := flag.Bool("remove-keep-files", false, "When removing a device, keep uploaded files in the bucket (only remove from manifests)")
+	renameTo := flag.String("rename-to", "", "Rename a device (--device old --rename-to new) by moving all files and updating manifests")
 	flag.Parse()
 
 	if *debug {
@@ -885,6 +888,27 @@ func main() {
 	// Validate args
 	if *listImages {
 		// No other args needed for listing
+	} else if *renameTo != "" {
+		// For renaming a device, we need source and target
+		if err := validateDeviceType(*deviceType); err != nil {
+			log.WithError(err).Fatal("Invalid source device type")
+		}
+		if err := validateDeviceType(*renameTo); err != nil {
+			log.WithError(err).Fatal("Invalid target device type (--rename-to)")
+		}
+		if *deviceType == *renameTo {
+			log.Fatal("Source and target device types are the same")
+		}
+	} else if *removeDevice && *firmware {
+		// For removing a firmware chip, we need the chip type
+		if err := validateDeviceType(*chip); err != nil {
+			log.WithError(err).Fatal("Invalid chip type")
+		}
+	} else if *removeDevice {
+		// For removing a device, we need the device type
+		if err := validateDeviceType(*deviceType); err != nil {
+			log.WithError(err).Fatal("Invalid device type")
+		}
 	} else if *firmware && *createDevice {
 		// For creating a firmware chip, we need the chip type
 		if err := validateDeviceType(*chip); err != nil {
@@ -990,6 +1014,30 @@ func main() {
 	// List images if requested
 	if *listImages {
 		listImagesInBucket(ctx, bucket)
+		return
+	}
+
+	// Rename device if requested
+	if *renameTo != "" {
+		if err := renameDeviceType(ctx, bucket, *deviceType, *renameTo); err != nil {
+			log.WithError(err).Fatal("Failed to rename device")
+		}
+		return
+	}
+
+	// Remove firmware chip if requested
+	if *removeDevice && *firmware {
+		if err := removeFirmwareChip(ctx, bucket, *chip, !*removeKeepFiles); err != nil {
+			log.WithError(err).Fatal("Failed to remove firmware chip")
+		}
+		return
+	}
+
+	// Remove device if requested
+	if *removeDevice {
+		if err := removeDeviceType(ctx, bucket, *deviceType, !*removeKeepFiles); err != nil {
+			log.WithError(err).Fatal("Failed to remove device")
+		}
 		return
 	}
 
@@ -3025,5 +3073,397 @@ func createNewFirmwareChip(ctx context.Context, bucket *storage.BucketHandle, ch
 	}
 
 	logger.Info("Successfully updated master manifest with new firmware chip")
+	return nil
+}
+
+// deleteObjectsByPrefix deletes all objects in the bucket with the given prefix
+func deleteObjectsByPrefix(ctx context.Context, bucket *storage.BucketHandle, prefix string) (int, error) {
+	it := bucket.Objects(ctx, &storage.Query{Prefix: prefix})
+	deleted := 0
+
+	for {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return deleted, fmt.Errorf("listing objects with prefix %q: %w", prefix, err)
+		}
+
+		if err := bucket.Object(attrs.Name).Delete(ctx); err != nil {
+			return deleted, fmt.Errorf("deleting object %q: %w", attrs.Name, err)
+		}
+		deleted++
+		log.WithField("object", attrs.Name).Debug("Deleted object")
+	}
+
+	return deleted, nil
+}
+
+// removeDeviceType removes a device type from the manifests and optionally deletes its files
+func removeDeviceType(ctx context.Context, bucket *storage.BucketHandle, deviceType string, deleteFiles bool) error {
+	logger := log.WithFields(logrus.Fields{
+		"device_type":  deviceType,
+		"delete_files": deleteFiles,
+	})
+	logger.Info("Removing device type")
+
+	// Read the master manifest
+	masterManifestPath := "manifests/master.json"
+	masterObj := bucket.Object(masterManifestPath)
+
+	var masterManifest MasterManifest
+	r, err := masterObj.NewReader(ctx)
+	if err != nil {
+		logger.WithError(err).Error("Failed to read master manifest")
+		return fmt.Errorf("failed to read master manifest: %w", err)
+	}
+	limitedReader := io.LimitReader(r, 10*1024*1024)
+	content, err := io.ReadAll(limitedReader)
+	r.Close()
+	if err != nil {
+		logger.WithError(err).Error("Failed to read master manifest content")
+		return fmt.Errorf("failed to read master manifest: %w", err)
+	}
+
+	if err := json.Unmarshal(content, &masterManifest); err != nil {
+		logger.WithError(err).Error("Failed to decode master manifest")
+		return fmt.Errorf("failed to decode master manifest: %w", err)
+	}
+
+	// Check that the device exists
+	if _, exists := masterManifest.Devices[deviceType]; !exists {
+		logger.Error("Device type not found in master manifest")
+		return fmt.Errorf("device type %q not found in master manifest", deviceType)
+	}
+
+	// Delete uploaded files if requested
+	if deleteFiles {
+		prefix := fmt.Sprintf("images/%s/", deviceType)
+		logger.WithField("prefix", prefix).Info("Deleting uploaded images")
+		deleted, err := deleteObjectsByPrefix(ctx, bucket, prefix)
+		if err != nil {
+			logger.WithError(err).Error("Failed to delete images")
+			return fmt.Errorf("failed to delete images: %w", err)
+		}
+		logger.WithField("deleted_count", deleted).Info("Deleted image files")
+	}
+
+	// Delete the device manifest
+	manifestPath := fmt.Sprintf("manifests/%s.json", deviceType)
+	logger.WithField("manifest_path", manifestPath).Info("Deleting device manifest")
+	if err := bucket.Object(manifestPath).Delete(ctx); err != nil {
+		logger.WithError(err).Warn("Failed to delete device manifest (may not exist)")
+	} else {
+		logger.Info("Deleted device manifest")
+	}
+
+	// Remove from master manifest and write it back
+	delete(masterManifest.Devices, deviceType)
+	masterManifest.LastUpdated = time.Now()
+
+	w := masterObj.NewWriter(ctx)
+	updatedContent, err := json.MarshalIndent(masterManifest, "", "  ")
+	if err != nil {
+		logger.WithError(err).Error("Failed to marshal master manifest")
+		return fmt.Errorf("failed to marshal master manifest: %w", err)
+	}
+
+	if _, err := w.Write(updatedContent); err != nil {
+		w.Close()
+		logger.WithError(err).Error("Failed to write master manifest")
+		return fmt.Errorf("failed to write master manifest: %w", err)
+	}
+
+	if err := w.Close(); err != nil {
+		logger.WithError(err).Error("Failed to finalize master manifest write")
+		return fmt.Errorf("failed to finalize master manifest write: %w", err)
+	}
+
+	logger.Info("Successfully removed device type")
+	return nil
+}
+
+// copyObject copies a GCS object from src to dst within the same bucket
+func copyObject(ctx context.Context, bucket *storage.BucketHandle, src, dst string) error {
+	srcObj := bucket.Object(src)
+	dstObj := bucket.Object(dst)
+	if _, err := dstObj.CopierFrom(srcObj).Run(ctx); err != nil {
+		return fmt.Errorf("copying %q to %q: %w", src, dst, err)
+	}
+	return nil
+}
+
+// renameDeviceType moves all files and manifest data from one device type to another
+func renameDeviceType(ctx context.Context, bucket *storage.BucketHandle, oldDevice, newDevice string) error {
+	logger := log.WithFields(logrus.Fields{
+		"old_device": oldDevice,
+		"new_device": newDevice,
+	})
+	logger.Info("Renaming device type")
+
+	// Read the master manifest
+	masterManifestPath := "manifests/master.json"
+	masterObj := bucket.Object(masterManifestPath)
+
+	var masterManifest MasterManifest
+	r, err := masterObj.NewReader(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read master manifest: %w", err)
+	}
+	limitedReader := io.LimitReader(r, 10*1024*1024)
+	content, err := io.ReadAll(limitedReader)
+	r.Close()
+	if err != nil {
+		return fmt.Errorf("failed to read master manifest: %w", err)
+	}
+
+	if err := json.Unmarshal(content, &masterManifest); err != nil {
+		return fmt.Errorf("failed to decode master manifest: %w", err)
+	}
+
+	// Verify source device exists
+	oldInfo, exists := masterManifest.Devices[oldDevice]
+	if !exists {
+		return fmt.Errorf("source device %q not found in master manifest", oldDevice)
+	}
+
+	// Read the source device manifest
+	oldManifestPath := fmt.Sprintf("manifests/%s.json", oldDevice)
+	oldManifestObj := bucket.Object(oldManifestPath)
+
+	var deviceManifest DeviceManifest
+	mr, err := oldManifestObj.NewReader(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read source device manifest: %w", err)
+	}
+	manifestContent, err := io.ReadAll(io.LimitReader(mr, 10*1024*1024))
+	mr.Close()
+	if err != nil {
+		return fmt.Errorf("failed to read source device manifest: %w", err)
+	}
+	if err := json.Unmarshal(manifestContent, &deviceManifest); err != nil {
+		return fmt.Errorf("failed to decode source device manifest: %w", err)
+	}
+
+	// If target device already exists, read its manifest to merge into
+	var targetManifest DeviceManifest
+	newManifestPath := fmt.Sprintf("manifests/%s.json", newDevice)
+	newManifestObj := bucket.Object(newManifestPath)
+
+	tmr, err := newManifestObj.NewReader(ctx)
+	if err == nil {
+		tmContent, err := io.ReadAll(io.LimitReader(tmr, 10*1024*1024))
+		tmr.Close()
+		if err != nil {
+			return fmt.Errorf("failed to read target device manifest: %w", err)
+		}
+		if err := json.Unmarshal(tmContent, &targetManifest); err != nil {
+			return fmt.Errorf("failed to decode target device manifest: %w", err)
+		}
+		logger.WithField("existing_versions", len(targetManifest.Versions)).Info("Target device already exists, merging versions")
+	} else {
+		targetManifest = DeviceManifest{
+			DeviceID: newDevice,
+			Versions: make(map[string]VersionMetadata),
+		}
+	}
+
+	// Copy all image files from old device to new device
+	oldPrefix := fmt.Sprintf("images/%s/", oldDevice)
+	newPrefix := fmt.Sprintf("images/%s/", newDevice)
+	logger.WithFields(logrus.Fields{
+		"old_prefix": oldPrefix,
+		"new_prefix": newPrefix,
+	}).Info("Copying image files")
+
+	it := bucket.Objects(ctx, &storage.Query{Prefix: oldPrefix})
+	var copied int
+	for {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("listing objects: %w", err)
+		}
+
+		newPath := newPrefix + strings.TrimPrefix(attrs.Name, oldPrefix)
+		if err := copyObject(ctx, bucket, attrs.Name, newPath); err != nil {
+			return fmt.Errorf("copying file: %w", err)
+		}
+		copied++
+		log.WithFields(logrus.Fields{
+			"from": attrs.Name,
+			"to":   newPath,
+		}).Debug("Copied file")
+	}
+	logger.WithField("copied_count", copied).Info("Copied image files")
+
+	// Merge versions from source into target, updating paths
+	for version, meta := range deviceManifest.Versions {
+		// Update the path to point to the new device location
+		meta.Path = strings.Replace(meta.Path, oldPrefix, newPrefix, 1)
+		if meta.OTAUpdatePath != "" {
+			meta.OTAUpdatePath = strings.Replace(meta.OTAUpdatePath, oldPrefix, newPrefix, 1)
+		}
+		if meta.RecoveryPath != "" {
+			meta.RecoveryPath = strings.Replace(meta.RecoveryPath, oldPrefix, newPrefix, 1)
+		}
+		targetManifest.Versions[version] = meta
+	}
+	targetManifest.DeviceID = newDevice
+
+	// Write the new device manifest
+	w := newManifestObj.NewWriter(ctx)
+	newContent, err := json.MarshalIndent(targetManifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal target device manifest: %w", err)
+	}
+	if _, err := w.Write(newContent); err != nil {
+		w.Close()
+		return fmt.Errorf("failed to write target device manifest: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("failed to finalize target device manifest: %w", err)
+	}
+	logger.Info("Wrote target device manifest")
+
+	// Delete old image files
+	deleted, err := deleteObjectsByPrefix(ctx, bucket, oldPrefix)
+	if err != nil {
+		return fmt.Errorf("failed to delete old image files: %w", err)
+	}
+	logger.WithField("deleted_count", deleted).Info("Deleted old image files")
+
+	// Delete old device manifest
+	if err := oldManifestObj.Delete(ctx); err != nil {
+		logger.WithError(err).Warn("Failed to delete old device manifest")
+	} else {
+		logger.Info("Deleted old device manifest")
+	}
+
+	// Update master manifest: remove old, add/update new
+	delete(masterManifest.Devices, oldDevice)
+	oldInfo.ManifestPath = newManifestPath
+
+	// Preserve existing target info if it was already there
+	if existingInfo, exists := masterManifest.Devices[newDevice]; exists {
+		// Keep the target's stability, update versions from source if they're newer
+		if oldInfo.Latest != "" {
+			existingInfo.Latest = oldInfo.Latest
+		}
+		if oldInfo.LatestNightly != "" {
+			existingInfo.LatestNightly = oldInfo.LatestNightly
+		}
+		masterManifest.Devices[newDevice] = existingInfo
+	} else {
+		masterManifest.Devices[newDevice] = oldInfo
+	}
+	masterManifest.LastUpdated = time.Now()
+
+	// Write master manifest
+	w = masterObj.NewWriter(ctx)
+	masterContent, err := json.MarshalIndent(masterManifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal master manifest: %w", err)
+	}
+	if _, err := w.Write(masterContent); err != nil {
+		w.Close()
+		return fmt.Errorf("failed to write master manifest: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("failed to finalize master manifest: %w", err)
+	}
+
+	logger.Info("Successfully renamed device type")
+	return nil
+}
+
+// removeFirmwareChip removes a firmware chip type from the manifests and optionally deletes its files
+func removeFirmwareChip(ctx context.Context, bucket *storage.BucketHandle, chip string, deleteFiles bool) error {
+	logger := log.WithFields(logrus.Fields{
+		"chip":         chip,
+		"delete_files": deleteFiles,
+	})
+	logger.Info("Removing firmware chip type")
+
+	// Read the master manifest
+	masterManifestPath := "manifests/master.json"
+	masterObj := bucket.Object(masterManifestPath)
+
+	var masterManifest MasterManifest
+	r, err := masterObj.NewReader(ctx)
+	if err != nil {
+		logger.WithError(err).Error("Failed to read master manifest")
+		return fmt.Errorf("failed to read master manifest: %w", err)
+	}
+	limitedReader := io.LimitReader(r, 10*1024*1024)
+	content, err := io.ReadAll(limitedReader)
+	r.Close()
+	if err != nil {
+		logger.WithError(err).Error("Failed to read master manifest content")
+		return fmt.Errorf("failed to read master manifest: %w", err)
+	}
+
+	if err := json.Unmarshal(content, &masterManifest); err != nil {
+		logger.WithError(err).Error("Failed to decode master manifest")
+		return fmt.Errorf("failed to decode master manifest: %w", err)
+	}
+
+	// Check that the firmware chip exists
+	if masterManifest.Firmware == nil {
+		logger.Error("No firmware section in master manifest")
+		return fmt.Errorf("firmware chip %q not found in master manifest (no firmware section)", chip)
+	}
+	if _, exists := masterManifest.Firmware[chip]; !exists {
+		logger.Error("Firmware chip not found in master manifest")
+		return fmt.Errorf("firmware chip %q not found in master manifest", chip)
+	}
+
+	// Delete uploaded files if requested
+	if deleteFiles {
+		prefix := fmt.Sprintf("firmware/%s/", chip)
+		logger.WithField("prefix", prefix).Info("Deleting uploaded firmware files")
+		deleted, err := deleteObjectsByPrefix(ctx, bucket, prefix)
+		if err != nil {
+			logger.WithError(err).Error("Failed to delete firmware files")
+			return fmt.Errorf("failed to delete firmware files: %w", err)
+		}
+		logger.WithField("deleted_count", deleted).Info("Deleted firmware files")
+	}
+
+	// Delete the firmware manifest
+	manifestPath := fmt.Sprintf("manifests/%s.json", chip)
+	logger.WithField("manifest_path", manifestPath).Info("Deleting firmware manifest")
+	if err := bucket.Object(manifestPath).Delete(ctx); err != nil {
+		logger.WithError(err).Warn("Failed to delete firmware manifest (may not exist)")
+	} else {
+		logger.Info("Deleted firmware manifest")
+	}
+
+	// Remove from master manifest and write it back
+	delete(masterManifest.Firmware, chip)
+	masterManifest.LastUpdated = time.Now()
+
+	w := masterObj.NewWriter(ctx)
+	updatedContent, err := json.MarshalIndent(masterManifest, "", "  ")
+	if err != nil {
+		logger.WithError(err).Error("Failed to marshal master manifest")
+		return fmt.Errorf("failed to marshal master manifest: %w", err)
+	}
+
+	if _, err := w.Write(updatedContent); err != nil {
+		w.Close()
+		logger.WithError(err).Error("Failed to write master manifest")
+		return fmt.Errorf("failed to write master manifest: %w", err)
+	}
+
+	if err := w.Close(); err != nil {
+		logger.WithError(err).Error("Failed to finalize master manifest write")
+		return fmt.Errorf("failed to finalize master manifest write: %w", err)
+	}
+
+	logger.Info("Successfully removed firmware chip type")
 	return nil
 }

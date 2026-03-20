@@ -79,7 +79,7 @@ type DeviceLatestInfo struct {
 // isOSImage checks if a file is an OS image based on its extension
 func isOSImage(filename string) bool {
 	ext := strings.ToLower(filepath.Ext(filename))
-	result := ext == ".img" || ext == ".zip" || ext == ".tgz"
+	result := ext == ".img" || ext == ".wic" || ext == ".zip" || ext == ".tgz"
 	log.WithFields(logrus.Fields{
 		"filename":  filename,
 		"extension": ext,

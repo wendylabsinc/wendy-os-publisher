@@ -26,8 +26,8 @@ import (
 
 var log = logrus.New()
 
-// Discord webhook URL for notifications
-const discordWebhookURL = "https://discord.com/api/webhooks/1465939532699402322/S7UbyqSjmXOxeiTZige8sYUSdTJS8eTnKnYhdR0RqQEHPJgWZwPFMdFSd0kbH-jwmM1K"
+// discordWebhookURL is read from the DISCORD_WEBHOOK_URL environment variable.
+var discordWebhookURL = os.Getenv("DISCORD_WEBHOOK_URL")
 
 // Discord embed colors
 const (
@@ -664,6 +664,9 @@ func compressFile(ctx context.Context, inputPath string, fileType string) (strin
 
 // sendDiscordNotification sends a notification to Discord about the update
 func sendDiscordNotification(deviceType, version string, isNightly bool, osSize int64, otaSize int64, recoverySize int64) error {
+	if discordWebhookURL == "" {
+		return fmt.Errorf("DISCORD_WEBHOOK_URL environment variable is not set")
+	}
 	buildType := "Stable"
 	color := colorStable
 	if isNightly {
@@ -2899,6 +2902,9 @@ func verifyFirmwareUpload(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 // sendFirmwareDiscordNotification sends a Discord embed with firmware publication details
 func sendFirmwareDiscordNotification(chip, version string, isNightly bool, fileSize int64) error {
+	if discordWebhookURL == "" {
+		return fmt.Errorf("DISCORD_WEBHOOK_URL environment variable is not set")
+	}
 	buildType := "Stable"
 	color := colorStable
 	if isNightly {

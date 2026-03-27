@@ -390,6 +390,7 @@ func isAlreadyCompressed(filename string) bool {
 		".xz", ".gz", ".bz2", ".zst", ".lz4", ".lzma",
 		".tar.gz", ".tgz", ".tar.xz", ".tar.zst", ".tar.bz2",
 		".zip", ".7z", ".rar",
+		".mender", // Mender Artifacts are tar containers with internally xz-compressed payloads
 	}
 
 	for _, ext := range compressedExts {
@@ -438,10 +439,6 @@ func compressFile(ctx context.Context, inputPath string, fileType string) (strin
 		} else {
 			compressionMethod = "zip" // Standard zip for OS images (widely compatible)
 		}
-	case ".mender":
-		// Mender OTA files should always use maximum compression
-		shouldCompress = true
-		compressionMethod = "xz-max"
 	default:
 		// Other file types - don't compress
 		log.WithFields(logrus.Fields{

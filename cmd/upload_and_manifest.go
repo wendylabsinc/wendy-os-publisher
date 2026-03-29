@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,6 +21,7 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
@@ -1717,158 +1719,167 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	obj := bucket.Object(manifestPath)
 
-	// Read existing manifest or create new one
-	var manifest DeviceManifest
-	var generation int64 // 0 means object doesn't exist yet
-	r, err := obj.NewReader(ctx)
-	if err == nil {
-		logger.Info("Reading existing device manifest")
+	const maxRetries = 5
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Read existing manifest or create new one
+		var manifest DeviceManifest
+		var generation int64 // 0 means object doesn't exist yet
+		r, err := obj.NewReader(ctx)
+		if err == nil {
+			logger.Info("Reading existing device manifest")
 
-		// Read content with size limit to prevent DoS
-		limitedReader := io.LimitReader(r, 10*1024*1024) // 10MB limit
-		content, err := io.ReadAll(limitedReader)
-		generation = r.Attrs.Generation
-		r.Close()
-		if err != nil {
-			logger.WithError(err).Error("Failed to read existing device manifest")
-			return fmt.Errorf("failed to read existing device manifest: %w", err)
+			// Read content with size limit to prevent DoS
+			limitedReader := io.LimitReader(r, 10*1024*1024) // 10MB limit
+			content, err := io.ReadAll(limitedReader)
+			generation = r.Attrs.Generation
+			r.Close()
+			if err != nil {
+				logger.WithError(err).Error("Failed to read existing device manifest")
+				return fmt.Errorf("failed to read existing device manifest: %w", err)
+			}
+
+			// Unmarshal JSON
+			if err := json.Unmarshal(content, &manifest); err != nil {
+				logger.WithError(err).Error("Failed to decode existing device manifest")
+				return fmt.Errorf("failed to decode existing device manifest: %w", err)
+			}
+
+			logger.WithField("version_count", len(manifest.Versions)).Info("Read existing manifest")
+		} else {
+			// Create new manifest if it doesn't exist
+			logger.WithError(err).Info("Creating new device manifest as it doesn't exist")
+			manifest = DeviceManifest{
+				DeviceID: deviceType,
+				Versions: make(map[string]VersionMetadata),
+			}
 		}
 
-		// Unmarshal JSON
-		if err := json.Unmarshal(content, &manifest); err != nil {
-			logger.WithError(err).Error("Failed to decode existing device manifest")
-			return fmt.Errorf("failed to decode existing device manifest: %w", err)
+		// Check if version already exists with a different IsNightly flag
+		if existingVersion, exists := manifest.Versions[version]; exists {
+			if existingVersion.IsNightly != isNightly {
+				logger.WithFields(logrus.Fields{
+					"version":        version,
+					"existing_type":  map[bool]string{true: "nightly", false: "stable"}[existingVersion.IsNightly],
+					"requested_type": map[bool]string{true: "nightly", false: "stable"}[isNightly],
+				}).Fatal("Cannot change build type for existing version - this would corrupt the manifest")
+			}
+			logger.WithField("version", version).Info("Version already exists, updating metadata")
 		}
 
-		logger.WithField("version_count", len(manifest.Versions)).Info("Read existing manifest")
-	} else {
-		// Create new manifest if it doesn't exist
-		logger.WithError(err).Info("Creating new device manifest as it doesn't exist")
-		manifest = DeviceManifest{
-			DeviceID: deviceType,
-			Versions: make(map[string]VersionMetadata),
+		// Update version information
+		if isNightly {
+			// For nightly builds, only update nightly versions' IsLatest
+			for k, v := range manifest.Versions {
+				if v.IsNightly {
+					v.IsLatest = false
+					manifest.Versions[k] = v
+				}
+			}
+			logger.WithField("version", version).Info("Setting version as latest nightly")
+		} else {
+			// For stable builds, only update stable versions' IsLatest
+			for k, v := range manifest.Versions {
+				if !v.IsNightly {
+					v.IsLatest = false
+					manifest.Versions[k] = v
+				}
+			}
+			logger.WithField("version", version).Info("Setting version as latest stable")
 		}
-	}
 
-	// Check if version already exists with a different IsNightly flag
-	if existingVersion, exists := manifest.Versions[version]; exists {
-		if existingVersion.IsNightly != isNightly {
+		// Add or update this version and mark as latest
+		// Start with existing metadata if version already exists, otherwise create new
+		versionMetadata, exists := manifest.Versions[version]
+		if !exists {
+			versionMetadata = VersionMetadata{}
+			logger.Info("Creating new version entry")
+		} else {
+			logger.Info("Updating existing version entry")
+		}
+
+		// Update release date
+		versionMetadata.ReleaseDate = time.Now()
+		versionMetadata.IsLatest = true
+		versionMetadata.IsNightly = isNightly
+
+		// Update OS image fields only if provided (filePath not empty)
+		if filePath != "" {
+			versionMetadata.Path = filePath
+			versionMetadata.Checksum = fileChecksum
+			versionMetadata.SizeBytes = fileSize
 			logger.WithFields(logrus.Fields{
-				"version":          version,
-				"existing_type":    map[bool]string{true: "nightly", false: "stable"}[existingVersion.IsNightly],
-				"requested_type":   map[bool]string{true: "nightly", false: "stable"}[isNightly],
-			}).Fatal("Cannot change build type for existing version - this would corrupt the manifest")
+				"path":     filePath,
+				"size":     fileSize,
+				"checksum": fileChecksum,
+			}).Info("Updating OS image metadata")
 		}
-		logger.WithField("version", version).Info("Version already exists, updating metadata")
-	}
 
-	// Update version information
-	if isNightly {
-		// For nightly builds, only update nightly versions' IsLatest
-		for k, v := range manifest.Versions {
-			if v.IsNightly {
-				v.IsLatest = false
-				manifest.Versions[k] = v
+		// Update OTA update fields only if provided
+		if otaUpdatePath != "" {
+			versionMetadata.OTAUpdatePath = otaUpdatePath
+			versionMetadata.OTAUpdateChecksum = otaUpdateChecksum
+			versionMetadata.OTAUpdateSizeBytes = otaUpdateSize
+			logger.WithFields(logrus.Fields{
+				"ota_path":     otaUpdatePath,
+				"ota_size":     otaUpdateSize,
+				"ota_checksum": otaUpdateChecksum,
+			}).Info("Updating OTA update metadata")
+		}
+
+		// Update recovery fields only if provided
+		if recoveryPath != "" {
+			versionMetadata.RecoveryPath = recoveryPath
+			versionMetadata.RecoveryChecksum = recoveryChecksum
+			versionMetadata.RecoverySizeBytes = recoverySize
+			logger.WithFields(logrus.Fields{
+				"recovery_path":     recoveryPath,
+				"recovery_size":     recoverySize,
+				"recovery_checksum": recoveryChecksum,
+			}).Info("Updating recovery file metadata")
+		}
+
+		// Validate that at least one file is provided
+		if filePath == "" && otaUpdatePath == "" && recoveryPath == "" {
+			logger.Error("Cannot create version entry with no files")
+			return fmt.Errorf("cannot create version entry with no files - at least one of OS image, OTA update, or recovery file must be provided")
+		}
+
+		manifest.Versions[version] = versionMetadata
+
+		// Write back to bucket using GenerationMatch to prevent lost updates from
+		// concurrent writers. generation=0 means the object must not exist yet.
+		logger.Info("Writing device manifest back to bucket")
+		w := obj.If(storage.Conditions{GenerationMatch: generation}).NewWriter(ctx)
+
+		// Marshal to JSON with indentation
+		content, err := json.MarshalIndent(manifest, "", "  ")
+		if err != nil {
+			logger.WithError(err).Error("Failed to marshal device manifest")
+			return fmt.Errorf("failed to marshal device manifest: %w", err)
+		}
+
+		// Write content
+		if _, err := w.Write(content); err != nil {
+			w.Close() // Close without checking error since write already failed
+			logger.WithError(err).Error("Failed to write device manifest")
+			return fmt.Errorf("failed to write device manifest: %w", err)
+		}
+
+		// Close to commit the write (MUST check error - this is when upload finalizes)
+		if err := w.Close(); err != nil {
+			var gErr *googleapi.Error
+			if errors.As(err, &gErr) && gErr.Code == 412 && attempt < maxRetries {
+				logger.WithField("attempt", attempt).Warn("Device manifest write lost race (412), retrying...")
+				continue
 			}
+			logger.WithError(err).Error("Failed to finalize device manifest write")
+			return fmt.Errorf("failed to finalize device manifest write: %w", err)
 		}
-		logger.WithField("version", version).Info("Setting version as latest nightly")
-	} else {
-		// For stable builds, only update stable versions' IsLatest
-		for k, v := range manifest.Versions {
-			if !v.IsNightly {
-				v.IsLatest = false
-				manifest.Versions[k] = v
-			}
-		}
-		logger.WithField("version", version).Info("Setting version as latest stable")
+
+		logger.Info("Successfully wrote device manifest")
+		return nil
 	}
-
-	// Add or update this version and mark as latest
-	// Start with existing metadata if version already exists, otherwise create new
-	versionMetadata, exists := manifest.Versions[version]
-	if !exists {
-		versionMetadata = VersionMetadata{}
-		logger.Info("Creating new version entry")
-	} else {
-		logger.Info("Updating existing version entry")
-	}
-
-	// Update release date
-	versionMetadata.ReleaseDate = time.Now()
-	versionMetadata.IsLatest = true
-	versionMetadata.IsNightly = isNightly
-
-	// Update OS image fields only if provided (filePath not empty)
-	if filePath != "" {
-		versionMetadata.Path = filePath
-		versionMetadata.Checksum = fileChecksum
-		versionMetadata.SizeBytes = fileSize
-		logger.WithFields(logrus.Fields{
-			"path":      filePath,
-			"size":      fileSize,
-			"checksum":  fileChecksum,
-		}).Info("Updating OS image metadata")
-	}
-
-	// Update OTA update fields only if provided
-	if otaUpdatePath != "" {
-		versionMetadata.OTAUpdatePath = otaUpdatePath
-		versionMetadata.OTAUpdateChecksum = otaUpdateChecksum
-		versionMetadata.OTAUpdateSizeBytes = otaUpdateSize
-		logger.WithFields(logrus.Fields{
-			"ota_path":     otaUpdatePath,
-			"ota_size":     otaUpdateSize,
-			"ota_checksum": otaUpdateChecksum,
-		}).Info("Updating OTA update metadata")
-	}
-
-	// Update recovery fields only if provided
-	if recoveryPath != "" {
-		versionMetadata.RecoveryPath = recoveryPath
-		versionMetadata.RecoveryChecksum = recoveryChecksum
-		versionMetadata.RecoverySizeBytes = recoverySize
-		logger.WithFields(logrus.Fields{
-			"recovery_path":     recoveryPath,
-			"recovery_size":     recoverySize,
-			"recovery_checksum": recoveryChecksum,
-		}).Info("Updating recovery file metadata")
-	}
-
-	// Validate that at least one file is provided
-	if filePath == "" && otaUpdatePath == "" && recoveryPath == "" {
-		logger.Error("Cannot create version entry with no files")
-		return fmt.Errorf("cannot create version entry with no files - at least one of OS image, OTA update, or recovery file must be provided")
-	}
-
-	manifest.Versions[version] = versionMetadata
-
-	// Write back to bucket using GenerationMatch to prevent lost updates from
-	// concurrent writers. generation=0 means the object must not exist yet.
-	logger.Info("Writing device manifest back to bucket")
-	w := obj.If(storage.Conditions{GenerationMatch: generation}).NewWriter(ctx)
-
-	// Marshal to JSON with indentation
-	content, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		logger.WithError(err).Error("Failed to marshal device manifest")
-		return fmt.Errorf("failed to marshal device manifest: %w", err)
-	}
-
-	// Write content
-	if _, err := w.Write(content); err != nil {
-		w.Close() // Close without checking error since write already failed
-		logger.WithError(err).Error("Failed to write device manifest")
-		return fmt.Errorf("failed to write device manifest: %w", err)
-	}
-
-	// Close to commit the write (MUST check error - this is when upload finalizes)
-	if err := w.Close(); err != nil {
-		logger.WithError(err).Error("Failed to finalize device manifest write")
-		return fmt.Errorf("failed to finalize device manifest write: %w", err)
-	}
-
-	logger.Info("Successfully wrote device manifest")
-	return nil
+	return fmt.Errorf("failed to write device manifest after %d attempts: concurrent writers", maxRetries)
 }
 
 func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version string, isNightly bool, stability string) error {
@@ -1878,99 +1889,108 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	obj := bucket.Object(masterManifestPath)
 
-	// Read existing manifest or create new one
-	var masterManifest MasterManifest
-	var generation int64 // 0 means object doesn't exist yet
-	r, err := obj.NewReader(ctx)
-	if err == nil {
-		logger.Info("Reading existing master manifest")
+	const maxRetries = 5
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Read existing manifest or create new one
+		var masterManifest MasterManifest
+		var generation int64 // 0 means object doesn't exist yet
+		r, err := obj.NewReader(ctx)
+		if err == nil {
+			logger.Info("Reading existing master manifest")
 
-		// Read content with size limit to prevent DoS
-		limitedReader := io.LimitReader(r, 10*1024*1024) // 10MB limit
-		content, err := io.ReadAll(limitedReader)
-		generation = r.Attrs.Generation
-		r.Close()
+			// Read content with size limit to prevent DoS
+			limitedReader := io.LimitReader(r, 10*1024*1024) // 10MB limit
+			content, err := io.ReadAll(limitedReader)
+			generation = r.Attrs.Generation
+			r.Close()
+			if err != nil {
+				logger.WithError(err).Error("Failed to read existing master manifest")
+				return fmt.Errorf("failed to read existing master manifest: %w", err)
+			}
+
+			// Unmarshal JSON
+			if err := json.Unmarshal(content, &masterManifest); err != nil {
+				logger.WithError(err).Error("Failed to decode existing master manifest")
+				return fmt.Errorf("failed to decode existing master manifest: %w", err)
+			}
+
+			logger.WithField("device_count", len(masterManifest.Devices)).Info("Read existing master manifest")
+		} else {
+			// Create new manifest if it doesn't exist
+			logger.WithError(err).Info("Creating new master manifest as it doesn't exist")
+			masterManifest = MasterManifest{
+				Devices: make(map[string]DeviceLatestInfo),
+			}
+		}
+
+		// Update master manifest
+		logger.WithFields(logrus.Fields{
+			"device_type": deviceType,
+			"version":     version,
+			"is_nightly":  isNightly,
+			"stability":   stability,
+		}).Info("Updating master manifest")
+
+		masterManifest.LastUpdated = time.Now()
+
+		// Get or create device info
+		deviceInfo, exists := masterManifest.Devices[deviceType]
+		if !exists {
+			deviceInfo = DeviceLatestInfo{}
+		}
+
+		// Always set ManifestPath to ensure consistency
+		deviceInfo.ManifestPath = fmt.Sprintf("manifests/%s.json", deviceType)
+
+		// Set stability (defaults to "stable" if empty)
+		if stability == "" {
+			stability = "stable"
+		}
+		deviceInfo.Stability = stability
+
+		// Update the appropriate latest version
+		if isNightly {
+			deviceInfo.LatestNightly = version
+		} else {
+			deviceInfo.Latest = version
+		}
+
+		masterManifest.Devices[deviceType] = deviceInfo
+
+		// Write back to bucket using GenerationMatch to prevent lost updates from
+		// concurrent writers. generation=0 means the object must not exist yet.
+		logger.Info("Writing master manifest back to bucket")
+		w := obj.If(storage.Conditions{GenerationMatch: generation}).NewWriter(ctx)
+
+		// Marshal to JSON with indentation
+		content, err := json.MarshalIndent(masterManifest, "", "  ")
 		if err != nil {
-			logger.WithError(err).Error("Failed to read existing master manifest")
-			return fmt.Errorf("failed to read existing master manifest: %w", err)
+			logger.WithError(err).Error("Failed to marshal master manifest")
+			return fmt.Errorf("failed to marshal master manifest: %w", err)
 		}
 
-		// Unmarshal JSON
-		if err := json.Unmarshal(content, &masterManifest); err != nil {
-			logger.WithError(err).Error("Failed to decode existing master manifest")
-			return fmt.Errorf("failed to decode existing master manifest: %w", err)
+		// Write content
+		if _, err := w.Write(content); err != nil {
+			w.Close() // Close without checking error since write already failed
+			logger.WithError(err).Error("Failed to write master manifest")
+			return fmt.Errorf("failed to write master manifest: %w", err)
 		}
 
-		logger.WithField("device_count", len(masterManifest.Devices)).Info("Read existing master manifest")
-	} else {
-		// Create new manifest if it doesn't exist
-		logger.WithError(err).Info("Creating new master manifest as it doesn't exist")
-		masterManifest = MasterManifest{
-			Devices: make(map[string]DeviceLatestInfo),
+		// Close to commit the write (MUST check error - this is when upload finalizes)
+		if err := w.Close(); err != nil {
+			var gErr *googleapi.Error
+			if errors.As(err, &gErr) && gErr.Code == 412 && attempt < maxRetries {
+				logger.WithField("attempt", attempt).Warn("Master manifest write lost race (412), retrying...")
+				continue
+			}
+			logger.WithError(err).Error("Failed to finalize master manifest write")
+			return fmt.Errorf("failed to finalize master manifest write: %w", err)
 		}
+
+		logger.Info("Successfully wrote master manifest")
+		return nil
 	}
-
-	// Update master manifest
-	logger.WithFields(logrus.Fields{
-		"device_type": deviceType,
-		"version":     version,
-		"is_nightly":  isNightly,
-		"stability":   stability,
-	}).Info("Updating master manifest")
-
-	masterManifest.LastUpdated = time.Now()
-
-	// Get or create device info
-	deviceInfo, exists := masterManifest.Devices[deviceType]
-	if !exists {
-		deviceInfo = DeviceLatestInfo{}
-	}
-
-	// Always set ManifestPath to ensure consistency
-	deviceInfo.ManifestPath = fmt.Sprintf("manifests/%s.json", deviceType)
-
-	// Set stability (defaults to "stable" if empty)
-	if stability == "" {
-		stability = "stable"
-	}
-	deviceInfo.Stability = stability
-
-	// Update the appropriate latest version
-	if isNightly {
-		deviceInfo.LatestNightly = version
-	} else {
-		deviceInfo.Latest = version
-	}
-
-	masterManifest.Devices[deviceType] = deviceInfo
-
-	// Write back to bucket using GenerationMatch to prevent lost updates from
-	// concurrent writers. generation=0 means the object must not exist yet.
-	logger.Info("Writing master manifest back to bucket")
-	w := obj.If(storage.Conditions{GenerationMatch: generation}).NewWriter(ctx)
-
-	// Marshal to JSON with indentation
-	content, err := json.MarshalIndent(masterManifest, "", "  ")
-	if err != nil {
-		logger.WithError(err).Error("Failed to marshal master manifest")
-		return fmt.Errorf("failed to marshal master manifest: %w", err)
-	}
-
-	// Write content
-	if _, err := w.Write(content); err != nil {
-		w.Close() // Close without checking error since write already failed
-		logger.WithError(err).Error("Failed to write master manifest")
-		return fmt.Errorf("failed to write master manifest: %w", err)
-	}
-
-	// Close to commit the write (MUST check error - this is when upload finalizes)
-	if err := w.Close(); err != nil {
-		logger.WithError(err).Error("Failed to finalize master manifest write")
-		return fmt.Errorf("failed to finalize master manifest write: %w", err)
-	}
-
-	logger.Info("Successfully wrote master manifest")
-	return nil
+	return fmt.Errorf("failed to write master manifest after %d attempts: concurrent writers", maxRetries)
 }
 
 // createNewDevice creates a new device type in both manifests

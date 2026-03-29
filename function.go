@@ -209,16 +209,19 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	obj := bucket.Object(manifestPath)
 
-	// Read existing manifest or create new one
+	// Read existing manifest or create new one, capturing generation for optimistic locking
 	var manifest DeviceManifest
+	var generation int64 // 0 means object doesn't exist yet
 	r, err := obj.NewReader(ctx)
 	if err == nil {
-		defer r.Close()
+		generation = r.Attrs.Generation
 		logger.Info("Reading existing device manifest")
 		if err := json.NewDecoder(r).Decode(&manifest); err != nil {
+			r.Close()
 			logger.WithError(err).Error("Failed to decode existing device manifest")
 			return fmt.Errorf("json.Decode: %v", err)
 		}
+		r.Close()
 		logger.WithField("version_count", len(manifest.Versions)).Info("Read existing manifest")
 	} else {
 		// Create new manifest if it doesn't exist
@@ -263,25 +266,30 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 		logger.WithField("version", version).Info("Setting version as latest stable")
 	}
 
-	// Add or update this version and mark as latest
-	manifest.Versions[version] = VersionMetadata{
-		ReleaseDate: time.Now(),
-		Path:        filePath,
-		SizeBytes:   attrs.Size,
-		IsLatest:    true,
-		IsNightly:   isNightly,
-	}
+	// Preserve existing metadata (especially Checksum set by upload_and_manifest.go)
+	// and only update fields this function owns.
+	versionMetadata := manifest.Versions[version]
+	versionMetadata.ReleaseDate = time.Now()
+	versionMetadata.Path = filePath
+	versionMetadata.SizeBytes = attrs.Size
+	versionMetadata.IsLatest = true
+	versionMetadata.IsNightly = isNightly
+	manifest.Versions[version] = versionMetadata
 
-	// Write back to bucket
+	// Write back using GenerationMatch to prevent overwriting concurrent writes
 	logger.Info("Writing device manifest back to bucket")
-	w := obj.NewWriter(ctx)
-	defer w.Close()
+	w := obj.If(storage.Conditions{GenerationMatch: generation}).NewWriter(ctx)
 
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(manifest); err != nil {
+		w.Close()
 		logger.WithError(err).Error("Failed to write device manifest")
 		return err
+	}
+	if err := w.Close(); err != nil {
+		logger.WithError(err).Error("Failed to finalize device manifest write")
+		return fmt.Errorf("finalizing device manifest write (possible concurrent update): %w", err)
 	}
 	logger.Info("Successfully wrote device manifest")
 	return nil
@@ -294,16 +302,19 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	obj := bucket.Object(masterManifestPath)
 
-	// Read existing manifest or create new one
+	// Read existing manifest or create new one, capturing generation for optimistic locking
 	var masterManifest MasterManifest
+	var generation int64 // 0 means object doesn't exist yet
 	r, err := obj.NewReader(ctx)
 	if err == nil {
-		defer r.Close()
+		generation = r.Attrs.Generation
 		logger.Info("Reading existing master manifest")
 		if err := json.NewDecoder(r).Decode(&masterManifest); err != nil {
+			r.Close()
 			logger.WithError(err).Error("Failed to decode existing master manifest")
 			return fmt.Errorf("json.Decode: %v", err)
 		}
+		r.Close()
 		logger.WithField("device_count", len(masterManifest.Devices)).Info("Read existing master manifest")
 	} else {
 		// Create new manifest if it doesn't exist
@@ -340,16 +351,20 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	masterManifest.Devices[deviceType] = deviceInfo
 
-	// Write back to bucket
+	// Write back using GenerationMatch to prevent overwriting concurrent writes
 	logger.Info("Writing master manifest back to bucket")
-	w := obj.NewWriter(ctx)
-	defer w.Close()
+	w := obj.If(storage.Conditions{GenerationMatch: generation}).NewWriter(ctx)
 
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(masterManifest); err != nil {
+		w.Close()
 		logger.WithError(err).Error("Failed to write master manifest")
 		return err
+	}
+	if err := w.Close(); err != nil {
+		logger.WithError(err).Error("Failed to finalize master manifest write")
+		return fmt.Errorf("finalizing master manifest write (possible concurrent update): %w", err)
 	}
 	logger.Info("Successfully wrote master manifest")
 	return nil

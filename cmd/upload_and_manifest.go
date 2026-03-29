@@ -335,17 +335,31 @@ func uploadFileAsync(ctx context.Context, bucket *storage.BucketHandle, localPat
 	go func() {
 		defer close(resultChan)
 
+		// Stat the local file before uploading so we can verify the upload completed fully
+		localInfo, err := os.Stat(localPath)
+		if err != nil {
+			resultChan <- uploadResult{err: fmt.Errorf("failed to stat local file: %w", err)}
+			return
+		}
+		expectedSize := localInfo.Size()
+
 		path, err := uploadFile(ctx, bucket, localPath, deviceType, version)
 		if err != nil {
 			resultChan <- uploadResult{err: err}
 			return
 		}
 
-		// Get file size
+		// Get file size from GCS and verify it matches the local file.
+		// A mismatch indicates a silent truncation (e.g. auth token expired mid-upload).
 		obj := bucket.Object(path)
 		attrs, err := obj.Attrs(ctx)
 		if err != nil {
 			resultChan <- uploadResult{err: fmt.Errorf("failed to get file attributes: %w", err)}
+			return
+		}
+
+		if attrs.Size != expectedSize {
+			resultChan <- uploadResult{err: fmt.Errorf("upload truncated: GCS object is %d bytes but local file is %d bytes (token may have expired mid-upload)", attrs.Size, expectedSize)}
 			return
 		}
 
@@ -1705,14 +1719,16 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	// Read existing manifest or create new one
 	var manifest DeviceManifest
+	var generation int64 // 0 means object doesn't exist yet
 	r, err := obj.NewReader(ctx)
 	if err == nil {
-		defer r.Close()
 		logger.Info("Reading existing device manifest")
 
 		// Read content with size limit to prevent DoS
 		limitedReader := io.LimitReader(r, 10*1024*1024) // 10MB limit
 		content, err := io.ReadAll(limitedReader)
+		generation = r.Attrs.Generation
+		r.Close()
 		if err != nil {
 			logger.WithError(err).Error("Failed to read existing device manifest")
 			return fmt.Errorf("failed to read existing device manifest: %w", err)
@@ -1826,9 +1842,10 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	manifest.Versions[version] = versionMetadata
 
-	// Write back to bucket
+	// Write back to bucket using GenerationMatch to prevent lost updates from
+	// concurrent writers. generation=0 means the object must not exist yet.
 	logger.Info("Writing device manifest back to bucket")
-	w := obj.NewWriter(ctx)
+	w := obj.If(storage.Conditions{GenerationMatch: generation}).NewWriter(ctx)
 
 	// Marshal to JSON with indentation
 	content, err := json.MarshalIndent(manifest, "", "  ")
@@ -1863,14 +1880,16 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	// Read existing manifest or create new one
 	var masterManifest MasterManifest
+	var generation int64 // 0 means object doesn't exist yet
 	r, err := obj.NewReader(ctx)
 	if err == nil {
-		defer r.Close()
 		logger.Info("Reading existing master manifest")
 
 		// Read content with size limit to prevent DoS
 		limitedReader := io.LimitReader(r, 10*1024*1024) // 10MB limit
 		content, err := io.ReadAll(limitedReader)
+		generation = r.Attrs.Generation
+		r.Close()
 		if err != nil {
 			logger.WithError(err).Error("Failed to read existing master manifest")
 			return fmt.Errorf("failed to read existing master manifest: %w", err)
@@ -1925,9 +1944,10 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	masterManifest.Devices[deviceType] = deviceInfo
 
-	// Write back to bucket
+	// Write back to bucket using GenerationMatch to prevent lost updates from
+	// concurrent writers. generation=0 means the object must not exist yet.
 	logger.Info("Writing master manifest back to bucket")
-	w := obj.NewWriter(ctx)
+	w := obj.If(storage.Conditions{GenerationMatch: generation}).NewWriter(ctx)
 
 	// Marshal to JSON with indentation
 	content, err := json.MarshalIndent(masterManifest, "", "  ")

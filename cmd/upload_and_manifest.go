@@ -886,6 +886,7 @@ func main() {
 	nightly := flag.Bool("nightly", false, "Mark this build as a nightly/untested build")
 	stability := flag.String("stability", "stable", "Device stability level: stable, experimental, deprecated")
 	notifyDiscord := flag.Bool("notify-discord", true, "Send Discord notification after successful publish")
+	notifyOnly := flag.Bool("notify-only", false, "Send Discord notification for an already-published release (reads sizes from manifest)")
 	accessToken := flag.String("access-token", "", "GCS access token (from gcloud auth print-access-token)")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	promote := flag.Bool("promote", false, "Promote nightly to stable by removing 'nightly' from version name")
@@ -904,6 +905,14 @@ func main() {
 	// Validate args
 	if *listImages {
 		// No other args needed for listing
+	} else if *notifyOnly {
+		// For notify-only, we need device type and version
+		if err := validateDeviceType(*deviceType); err != nil {
+			log.WithError(err).Fatal("Invalid device type")
+		}
+		if err := validateVersion(*version); err != nil {
+			log.WithError(err).Fatal("Invalid version")
+		}
 	} else if *renameTo != "" {
 		// For renaming a device, we need source and target
 		if err := validateDeviceType(*deviceType); err != nil {
@@ -1030,6 +1039,33 @@ func main() {
 	// List images if requested
 	if *listImages {
 		listImagesInBucket(ctx, bucket)
+		return
+	}
+
+	// Send notification for an already-published release
+	if *notifyOnly {
+		manifestPath := fmt.Sprintf("manifests/%s.json", *deviceType)
+		r, err := bucket.Object(manifestPath).NewReader(ctx)
+		if err != nil {
+			log.WithError(err).Fatal("Failed to read device manifest")
+		}
+		content, err := io.ReadAll(io.LimitReader(r, 10*1024*1024))
+		r.Close()
+		if err != nil {
+			log.WithError(err).Fatal("Failed to read device manifest content")
+		}
+		var manifest DeviceManifest
+		if err := json.Unmarshal(content, &manifest); err != nil {
+			log.WithError(err).Fatal("Failed to parse device manifest")
+		}
+		versionMeta, exists := manifest.Versions[*version]
+		if !exists {
+			log.Fatalf("Version %s not found in manifest for device %s", *version, *deviceType)
+		}
+		if err := sendDiscordNotification(*deviceType, *version, versionMeta.IsNightly, versionMeta.SizeBytes, versionMeta.OTAUpdateSizeBytes, versionMeta.RecoverySizeBytes); err != nil {
+			log.WithError(err).Fatal("Failed to send Discord notification")
+		}
+		log.Info("Discord notification sent successfully")
 		return
 	}
 

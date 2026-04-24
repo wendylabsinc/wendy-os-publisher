@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
@@ -1580,7 +1581,7 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	obj := bucket.Object(manifestPath)
 
-	const maxRetries = 5
+	const maxRetries = 10
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// Read existing manifest or create new one
 		var manifest DeviceManifest
@@ -1738,6 +1739,7 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 			var gErr *googleapi.Error
 			if errors.As(err, &gErr) && gErr.Code == 412 && attempt < maxRetries {
 				logger.WithField("attempt", attempt).Warn("Device manifest write lost race (412), retrying...")
+				time.Sleep(time.Duration(50+rand.Intn(150)) * time.Millisecond)
 				continue
 			}
 			logger.WithError(err).Error("Failed to finalize device manifest write")
@@ -1757,7 +1759,7 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	obj := bucket.Object(masterManifestPath)
 
-	const maxRetries = 5
+	const maxRetries = 10
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// Read existing manifest or create new one
 		var masterManifest MasterManifest
@@ -1856,6 +1858,7 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 			var gErr *googleapi.Error
 			if errors.As(err, &gErr) && gErr.Code == 412 && attempt < maxRetries {
 				logger.WithField("attempt", attempt).Warn("Master manifest write lost race (412), retrying...")
+				time.Sleep(time.Duration(50+rand.Intn(150)) * time.Millisecond)
 				continue
 			}
 			logger.WithError(err).Error("Failed to finalize master manifest write")

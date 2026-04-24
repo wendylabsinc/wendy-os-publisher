@@ -1708,9 +1708,16 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 		manifest.Versions[version] = versionMetadata
 
 		// Write back to bucket using GenerationMatch to prevent lost updates from
-		// concurrent writers. generation=0 means the object must not exist yet.
+		// concurrent writers. Use DoesNotExist when creating a new object because
+		// GenerationMatch:0 is the zero value and the GCS client rejects it as "empty conditions".
 		logger.Info("Writing device manifest back to bucket")
-		w := obj.If(storage.Conditions{GenerationMatch: generation}).NewWriter(ctx)
+		var deviceConds storage.Conditions
+		if generation == 0 {
+			deviceConds = storage.Conditions{DoesNotExist: true}
+		} else {
+			deviceConds = storage.Conditions{GenerationMatch: generation}
+		}
+		w := obj.If(deviceConds).NewWriter(ctx)
 
 		// Marshal to JSON with indentation
 		content, err := json.MarshalIndent(manifest, "", "  ")
@@ -1819,9 +1826,16 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 		masterManifest.Devices[deviceType] = deviceInfo
 
 		// Write back to bucket using GenerationMatch to prevent lost updates from
-		// concurrent writers. generation=0 means the object must not exist yet.
+		// concurrent writers. Use DoesNotExist when creating a new object because
+		// GenerationMatch:0 is the zero value and the GCS client rejects it as "empty conditions".
 		logger.Info("Writing master manifest back to bucket")
-		w := obj.If(storage.Conditions{GenerationMatch: generation}).NewWriter(ctx)
+		var masterConds storage.Conditions
+		if generation == 0 {
+			masterConds = storage.Conditions{DoesNotExist: true}
+		} else {
+			masterConds = storage.Conditions{GenerationMatch: generation}
+		}
+		w := obj.If(masterConds).NewWriter(ctx)
 
 		// Marshal to JSON with indentation
 		content, err := json.MarshalIndent(masterManifest, "", "  ")

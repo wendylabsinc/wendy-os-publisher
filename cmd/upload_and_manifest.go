@@ -882,6 +882,8 @@ func main() {
 	otaUpdateFile := flag.String("ota-update", "", "Local OTA update file path to upload")
 	recoveryFile := flag.String("recovery-file", "", "Optional recovery/tegraflash file path to upload")
 	updateOnly := flag.Bool("update-only", false, "Only update manifests without uploading")
+	skipMasterManifest := flag.Bool("skip-master-manifest", false, "Skip master manifest update (a separate job will handle it)")
+	masterManifestOnly := flag.Bool("master-manifest-only", false, "Only update the master manifest, skip upload and device manifest")
 	listImages := flag.Bool("list", false, "List all images in the bucket")
 	createDevice := flag.Bool("create-device", false, "Create a new device type in the manifest")
 	nightly := flag.Bool("nightly", false, "Mark this build as a nightly/untested build")
@@ -995,7 +997,7 @@ func main() {
 		if err := validateStability(*stability); err != nil {
 			log.WithError(err).Fatal("Invalid stability")
 		}
-		if !*updateOnly {
+		if !*updateOnly && !*masterManifestOnly {
 			// At least one file (main, OTA, or recovery) must be provided
 			if *localFile == "" && *otaUpdateFile == "" && *recoveryFile == "" {
 				log.Fatal("At least one file must be provided: use --file for OS image, --ota-update for OTA update, or --recovery-file for recovery file")
@@ -1067,6 +1069,20 @@ func main() {
 			log.WithError(err).Fatal("Failed to send Discord notification")
 		}
 		log.Info("Discord notification sent successfully")
+		return
+	}
+
+	// Update only the master manifest (used by a serialised publish job after parallel builds)
+	if *masterManifestOnly {
+		logger := log.WithFields(logrus.Fields{
+			"device_type": *deviceType,
+			"version":     *version,
+			"is_nightly":  *nightly,
+			"stability":   *stability,
+		})
+		if err := updateMasterManifest(ctx, logger, bucket, *deviceType, *version, *nightly, *stability); err != nil {
+			log.WithError(err).Fatal("Failed to update master manifest")
+		}
 		return
 	}
 
@@ -1261,7 +1277,7 @@ func main() {
 			mainUpload.path, mainUpload.size, mainResult.checksum,
 			otaUpdateUpload.path, otaUpdateUpload.size, otaUpdateResult.checksum,
 			recoveryUpload.path, recoveryUpload.size, recoveryResult.checksum,
-			*nightly, *stability, *notifyDiscord,
+			*nightly, *stability, *notifyDiscord, *skipMasterManifest,
 		)
 	} else {
 		// Just update manifests for existing file
@@ -1335,7 +1351,7 @@ func main() {
 			recoverySize = recoveryAttrs.Size
 		}
 
-		updateManifests(ctx, bucket, *deviceType, *version, imagePath, attrs.Size, mainChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, *nightly, *stability, *notifyDiscord)
+		updateManifests(ctx, bucket, *deviceType, *version, imagePath, attrs.Size, mainChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, *nightly, *stability, *notifyDiscord, *skipMasterManifest)
 	}
 }
 
@@ -1496,7 +1512,7 @@ func uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, de
 	return destinationPath, nil
 }
 
-func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, fileChecksum string, otaUpdatePath string, otaUpdateSize int64, otaUpdateChecksum string, recoveryPath string, recoverySize int64, recoveryChecksum string, isNightly bool, stability string, notifyDiscord bool) {
+func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, fileChecksum string, otaUpdatePath string, otaUpdateSize int64, otaUpdateChecksum string, recoveryPath string, recoverySize int64, recoveryChecksum string, isNightly bool, stability string, notifyDiscord bool, skipMasterManifest bool) {
 	logger := log.WithFields(logrus.Fields{
 		"device_type":     deviceType,
 		"version":         version,
@@ -1507,15 +1523,8 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 		"stability":       stability,
 		"notify_discord":  notifyDiscord,
 	})
-	logger.Info("Updating manifests in parallel")
 
-	// Update device and master manifests in parallel
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// Create independent logger contexts for each goroutine to avoid races
-	// Copy all fields into separate maps before starting goroutines
-	deviceFields := logrus.Fields{
+	deviceLogger := log.WithFields(logrus.Fields{
 		"device_type":     deviceType,
 		"version":         version,
 		"file_path":       filePath,
@@ -1525,42 +1534,50 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 		"stability":       stability,
 		"notify_discord":  notifyDiscord,
 		"manifest_type":   "device",
-	}
-	masterFields := logrus.Fields{
-		"device_type":    deviceType,
-		"version":        version,
-		"is_nightly":     isNightly,
-		"stability":      stability,
-		"notify_discord": notifyDiscord,
-		"manifest_type":  "master",
-	}
+	})
 
-	// Use channels to capture errors safely (no race condition)
-	deviceErrChan := make(chan error, 1)
-	masterErrChan := make(chan error, 1)
+	if skipMasterManifest {
+		logger.Info("Updating device manifest (master manifest will be updated by a separate publish job)")
+		if err := updateDeviceManifest(ctx, deviceLogger, bucket, deviceType, version, filePath, fileSize, fileChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, isNightly); err != nil {
+			logger.WithError(err).Fatal("Failed to update device manifest")
+		}
+	} else {
+		logger.Info("Updating device and master manifests in parallel")
 
-	go func() {
-		defer wg.Done()
-		deviceLogger := log.WithFields(deviceFields)
-		deviceErrChan <- updateDeviceManifest(ctx, deviceLogger, bucket, deviceType, version, filePath, fileSize, fileChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, isNightly)
-	}()
+		masterLogger := log.WithFields(logrus.Fields{
+			"device_type":    deviceType,
+			"version":        version,
+			"is_nightly":     isNightly,
+			"stability":      stability,
+			"notify_discord": notifyDiscord,
+			"manifest_type":  "master",
+		})
 
-	go func() {
-		defer wg.Done()
-		masterLogger := log.WithFields(masterFields)
-		masterErrChan <- updateMasterManifest(ctx, masterLogger, bucket, deviceType, version, isNightly, stability)
-	}()
+		var wg sync.WaitGroup
+		wg.Add(2)
+		deviceErrChan := make(chan error, 1)
+		masterErrChan := make(chan error, 1)
 
-	wg.Wait()
-	close(deviceErrChan)
-	close(masterErrChan)
+		go func() {
+			defer wg.Done()
+			deviceErrChan <- updateDeviceManifest(ctx, deviceLogger, bucket, deviceType, version, filePath, fileSize, fileChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, isNightly)
+		}()
 
-	// Check for errors - if either failed, exit with error
-	if deviceErr := <-deviceErrChan; deviceErr != nil {
-		logger.WithError(deviceErr).Fatal("Failed to update device manifest")
-	}
-	if masterErr := <-masterErrChan; masterErr != nil {
-		logger.WithError(masterErr).Fatal("Failed to update master manifest")
+		go func() {
+			defer wg.Done()
+			masterErrChan <- updateMasterManifest(ctx, masterLogger, bucket, deviceType, version, isNightly, stability)
+		}()
+
+		wg.Wait()
+		close(deviceErrChan)
+		close(masterErrChan)
+
+		if deviceErr := <-deviceErrChan; deviceErr != nil {
+			logger.WithError(deviceErr).Fatal("Failed to update device manifest")
+		}
+		if masterErr := <-masterErrChan; masterErr != nil {
+			logger.WithError(masterErr).Fatal("Failed to update master manifest")
+		}
 	}
 
 	logger.Info("Manifests updated successfully")
@@ -1739,7 +1756,11 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 			var gErr *googleapi.Error
 			if errors.As(err, &gErr) && gErr.Code == 412 && attempt < maxRetries {
 				logger.WithField("attempt", attempt).Warn("Device manifest write lost race (412), retrying...")
-				time.Sleep(time.Duration(50+rand.Intn(150)) * time.Millisecond)
+				backoff := time.Duration(1<<uint(attempt))*100*time.Millisecond + time.Duration(rand.Intn(200))*time.Millisecond
+				if backoff > 10*time.Second {
+					backoff = 10 * time.Second
+				}
+				time.Sleep(backoff)
 				continue
 			}
 			logger.WithError(err).Error("Failed to finalize device manifest write")
@@ -1858,7 +1879,11 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 			var gErr *googleapi.Error
 			if errors.As(err, &gErr) && gErr.Code == 412 && attempt < maxRetries {
 				logger.WithField("attempt", attempt).Warn("Master manifest write lost race (412), retrying...")
-				time.Sleep(time.Duration(50+rand.Intn(150)) * time.Millisecond)
+				backoff := time.Duration(1<<uint(attempt))*100*time.Millisecond + time.Duration(rand.Intn(200))*time.Millisecond
+				if backoff > 10*time.Second {
+					backoff = 10 * time.Second
+				}
+				time.Sleep(backoff)
 				continue
 			}
 			logger.WithError(err).Error("Failed to finalize master manifest write")

@@ -3,7 +3,9 @@ package function
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math/rand"
 	"path/filepath"
 	"strings"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
 	"github.com/cloudevents/sdk-go/v2/event"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/api/googleapi"
 )
 
 var log = logrus.New()
@@ -209,90 +212,111 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	obj := bucket.Object(manifestPath)
 
-	// Read existing manifest or create new one, capturing generation for optimistic locking
-	var manifest DeviceManifest
-	var generation int64 // 0 means object doesn't exist yet
-	r, err := obj.NewReader(ctx)
-	if err == nil {
-		generation = r.Attrs.Generation
-		logger.Info("Reading existing device manifest")
-		if err := json.NewDecoder(r).Decode(&manifest); err != nil {
+	const maxRetries = 10
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Read existing manifest or create new one, capturing generation for optimistic locking
+		var manifest DeviceManifest
+		var generation int64 // 0 means object doesn't exist yet
+		r, err := obj.NewReader(ctx)
+		if err == nil {
+			generation = r.Attrs.Generation
+			logger.Info("Reading existing device manifest")
+			if err := json.NewDecoder(r).Decode(&manifest); err != nil {
+				r.Close()
+				logger.WithError(err).Error("Failed to decode existing device manifest")
+				return fmt.Errorf("json.Decode: %v", err)
+			}
 			r.Close()
-			logger.WithError(err).Error("Failed to decode existing device manifest")
-			return fmt.Errorf("json.Decode: %v", err)
-		}
-		r.Close()
-		logger.WithField("version_count", len(manifest.Versions)).Info("Read existing manifest")
-	} else {
-		// Create new manifest if it doesn't exist
-		logger.WithError(err).Info("Creating new device manifest as it doesn't exist")
-		manifest = DeviceManifest{
-			DeviceID: deviceType,
-			Versions: make(map[string]VersionMetadata),
-		}
-	}
-
-	// Check if version already exists with a different IsNightly flag
-	if existingVersion, exists := manifest.Versions[version]; exists {
-		if existingVersion.IsNightly != isNightly {
-			errMsg := fmt.Sprintf("version %s already exists as %s build, cannot change to %s build",
-				version,
-				map[bool]string{true: "nightly", false: "stable"}[existingVersion.IsNightly],
-				map[bool]string{true: "nightly", false: "stable"}[isNightly])
-			logger.Error(errMsg)
-			return fmt.Errorf("%s", errMsg)
-		}
-		logger.WithField("version", version).Info("Version already exists, updating metadata")
-	}
-
-	// Update version information
-	if isNightly {
-		// For nightly builds, only update nightly versions' IsLatest
-		for k, v := range manifest.Versions {
-			if v.IsNightly {
-				v.IsLatest = false
-				manifest.Versions[k] = v
+			logger.WithField("version_count", len(manifest.Versions)).Info("Read existing manifest")
+		} else {
+			// Create new manifest if it doesn't exist
+			logger.WithError(err).Info("Creating new device manifest as it doesn't exist")
+			manifest = DeviceManifest{
+				DeviceID: deviceType,
+				Versions: make(map[string]VersionMetadata),
 			}
 		}
-		logger.WithField("version", version).Info("Setting version as latest nightly")
-	} else {
-		// For stable builds, only update stable versions' IsLatest
-		for k, v := range manifest.Versions {
-			if !v.IsNightly {
-				v.IsLatest = false
-				manifest.Versions[k] = v
+
+		// Check if version already exists with a different IsNightly flag
+		if existingVersion, exists := manifest.Versions[version]; exists {
+			if existingVersion.IsNightly != isNightly {
+				errMsg := fmt.Sprintf("version %s already exists as %s build, cannot change to %s build",
+					version,
+					map[bool]string{true: "nightly", false: "stable"}[existingVersion.IsNightly],
+					map[bool]string{true: "nightly", false: "stable"}[isNightly])
+				logger.Error(errMsg)
+				return fmt.Errorf("%s", errMsg)
 			}
+			logger.WithField("version", version).Info("Version already exists, updating metadata")
 		}
-		logger.WithField("version", version).Info("Setting version as latest stable")
-	}
 
-	// Preserve existing metadata (especially Checksum set by upload_and_manifest.go)
-	// and only update fields this function owns.
-	versionMetadata := manifest.Versions[version]
-	versionMetadata.ReleaseDate = time.Now()
-	versionMetadata.Path = filePath
-	versionMetadata.SizeBytes = attrs.Size
-	versionMetadata.IsLatest = true
-	versionMetadata.IsNightly = isNightly
-	manifest.Versions[version] = versionMetadata
+		// Update version information
+		if isNightly {
+			// For nightly builds, only update nightly versions' IsLatest
+			for k, v := range manifest.Versions {
+				if v.IsNightly {
+					v.IsLatest = false
+					manifest.Versions[k] = v
+				}
+			}
+			logger.WithField("version", version).Info("Setting version as latest nightly")
+		} else {
+			// For stable builds, only update stable versions' IsLatest
+			for k, v := range manifest.Versions {
+				if !v.IsNightly {
+					v.IsLatest = false
+					manifest.Versions[k] = v
+				}
+			}
+			logger.WithField("version", version).Info("Setting version as latest stable")
+		}
 
-	// Write back using GenerationMatch to prevent overwriting concurrent writes
-	logger.Info("Writing device manifest back to bucket")
-	w := obj.If(storage.Conditions{GenerationMatch: generation}).NewWriter(ctx)
+		// Preserve existing metadata (especially Checksum set by upload_and_manifest.go)
+		// and only update fields this function owns.
+		versionMetadata := manifest.Versions[version]
+		versionMetadata.ReleaseDate = time.Now()
+		versionMetadata.Path = filePath
+		versionMetadata.SizeBytes = attrs.Size
+		versionMetadata.IsLatest = true
+		versionMetadata.IsNightly = isNightly
+		manifest.Versions[version] = versionMetadata
 
-	encoder := json.NewEncoder(w)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(manifest); err != nil {
-		w.Close()
-		logger.WithError(err).Error("Failed to write device manifest")
-		return err
+		// Write back using GenerationMatch to prevent overwriting concurrent writes.
+		// Use DoesNotExist when creating a new object — GenerationMatch:0 is rejected
+		// by the GCS client as empty conditions.
+		var conds storage.Conditions
+		if generation == 0 {
+			conds = storage.Conditions{DoesNotExist: true}
+		} else {
+			conds = storage.Conditions{GenerationMatch: generation}
+		}
+		w := obj.If(conds).NewWriter(ctx)
+
+		encoder := json.NewEncoder(w)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(manifest); err != nil {
+			w.Close()
+			logger.WithError(err).Error("Failed to write device manifest")
+			return err
+		}
+		if err := w.Close(); err != nil {
+			var gErr *googleapi.Error
+			if errors.As(err, &gErr) && gErr.Code == 412 && attempt < maxRetries {
+				logger.WithField("attempt", attempt).Warn("Device manifest write lost race (412), retrying...")
+				backoff := time.Duration(1<<uint(attempt))*100*time.Millisecond + time.Duration(rand.Intn(200))*time.Millisecond
+				if backoff > 10*time.Second {
+					backoff = 10 * time.Second
+				}
+				time.Sleep(backoff)
+				continue
+			}
+			logger.WithError(err).Error("Failed to finalize device manifest write")
+			return fmt.Errorf("finalizing device manifest write (possible concurrent update): %w", err)
+		}
+		logger.Info("Successfully wrote device manifest")
+		return nil
 	}
-	if err := w.Close(); err != nil {
-		logger.WithError(err).Error("Failed to finalize device manifest write")
-		return fmt.Errorf("finalizing device manifest write (possible concurrent update): %w", err)
-	}
-	logger.Info("Successfully wrote device manifest")
-	return nil
+	return fmt.Errorf("failed to write device manifest after %d attempts: concurrent writers", maxRetries)
 }
 
 func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version string, isNightly bool) error {
@@ -302,70 +326,91 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 	obj := bucket.Object(masterManifestPath)
 
-	// Read existing manifest or create new one, capturing generation for optimistic locking
-	var masterManifest MasterManifest
-	var generation int64 // 0 means object doesn't exist yet
-	r, err := obj.NewReader(ctx)
-	if err == nil {
-		generation = r.Attrs.Generation
-		logger.Info("Reading existing master manifest")
-		if err := json.NewDecoder(r).Decode(&masterManifest); err != nil {
+	const maxRetries = 10
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Read existing manifest or create new one, capturing generation for optimistic locking
+		var masterManifest MasterManifest
+		var generation int64 // 0 means object doesn't exist yet
+		r, err := obj.NewReader(ctx)
+		if err == nil {
+			generation = r.Attrs.Generation
+			logger.Info("Reading existing master manifest")
+			if err := json.NewDecoder(r).Decode(&masterManifest); err != nil {
+				r.Close()
+				logger.WithError(err).Error("Failed to decode existing master manifest")
+				return fmt.Errorf("json.Decode: %v", err)
+			}
 			r.Close()
-			logger.WithError(err).Error("Failed to decode existing master manifest")
-			return fmt.Errorf("json.Decode: %v", err)
+			logger.WithField("device_count", len(masterManifest.Devices)).Info("Read existing master manifest")
+		} else {
+			// Create new manifest if it doesn't exist
+			logger.WithError(err).Info("Creating new master manifest as it doesn't exist")
+			masterManifest = MasterManifest{
+				Devices: make(map[string]DeviceLatestInfo),
+			}
 		}
-		r.Close()
-		logger.WithField("device_count", len(masterManifest.Devices)).Info("Read existing master manifest")
-	} else {
-		// Create new manifest if it doesn't exist
-		logger.WithError(err).Info("Creating new master manifest as it doesn't exist")
-		masterManifest = MasterManifest{
-			Devices: make(map[string]DeviceLatestInfo),
+
+		// Update master manifest
+		logger.WithFields(logrus.Fields{
+			"device_type": deviceType,
+			"version":     version,
+			"is_nightly":  isNightly,
+		}).Info("Updating master manifest")
+
+		masterManifest.LastUpdated = time.Now()
+
+		// Get or create device info
+		deviceInfo, exists := masterManifest.Devices[deviceType]
+		if !exists {
+			deviceInfo = DeviceLatestInfo{}
 		}
+
+		// Always set ManifestPath to ensure consistency
+		deviceInfo.ManifestPath = fmt.Sprintf("manifests/%s.json", deviceType)
+
+		// Update the appropriate latest version
+		if isNightly {
+			deviceInfo.LatestNightly = version
+		} else {
+			deviceInfo.Latest = version
+		}
+
+		masterManifest.Devices[deviceType] = deviceInfo
+
+		// Write back using GenerationMatch to prevent overwriting concurrent writes.
+		// Use DoesNotExist when creating a new object — GenerationMatch:0 is rejected
+		// by the GCS client as empty conditions.
+		var conds storage.Conditions
+		if generation == 0 {
+			conds = storage.Conditions{DoesNotExist: true}
+		} else {
+			conds = storage.Conditions{GenerationMatch: generation}
+		}
+		w := obj.If(conds).NewWriter(ctx)
+
+		encoder := json.NewEncoder(w)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(masterManifest); err != nil {
+			w.Close()
+			logger.WithError(err).Error("Failed to write master manifest")
+			return err
+		}
+		if err := w.Close(); err != nil {
+			var gErr *googleapi.Error
+			if errors.As(err, &gErr) && gErr.Code == 412 && attempt < maxRetries {
+				logger.WithField("attempt", attempt).Warn("Master manifest write lost race (412), retrying...")
+				backoff := time.Duration(1<<uint(attempt))*100*time.Millisecond + time.Duration(rand.Intn(200))*time.Millisecond
+				if backoff > 10*time.Second {
+					backoff = 10 * time.Second
+				}
+				time.Sleep(backoff)
+				continue
+			}
+			logger.WithError(err).Error("Failed to finalize master manifest write")
+			return fmt.Errorf("finalizing master manifest write (possible concurrent update): %w", err)
+		}
+		logger.Info("Successfully wrote master manifest")
+		return nil
 	}
-
-	// Update master manifest
-	logger.WithFields(logrus.Fields{
-		"device_type": deviceType,
-		"version":     version,
-		"is_nightly":  isNightly,
-	}).Info("Updating master manifest")
-
-	masterManifest.LastUpdated = time.Now()
-
-	// Get or create device info
-	deviceInfo, exists := masterManifest.Devices[deviceType]
-	if !exists {
-		deviceInfo = DeviceLatestInfo{}
-	}
-
-	// Always set ManifestPath to ensure consistency
-	deviceInfo.ManifestPath = fmt.Sprintf("manifests/%s.json", deviceType)
-
-	// Update the appropriate latest version
-	if isNightly {
-		deviceInfo.LatestNightly = version
-	} else {
-		deviceInfo.Latest = version
-	}
-
-	masterManifest.Devices[deviceType] = deviceInfo
-
-	// Write back using GenerationMatch to prevent overwriting concurrent writes
-	logger.Info("Writing master manifest back to bucket")
-	w := obj.If(storage.Conditions{GenerationMatch: generation}).NewWriter(ctx)
-
-	encoder := json.NewEncoder(w)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(masterManifest); err != nil {
-		w.Close()
-		logger.WithError(err).Error("Failed to write master manifest")
-		return err
-	}
-	if err := w.Close(); err != nil {
-		logger.WithError(err).Error("Failed to finalize master manifest write")
-		return fmt.Errorf("finalizing master manifest write (possible concurrent update): %w", err)
-	}
-	logger.Info("Successfully wrote master manifest")
-	return nil
+	return fmt.Errorf("failed to write master manifest after %d attempts: concurrent writers", maxRetries)
 }

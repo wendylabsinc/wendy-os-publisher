@@ -1806,6 +1806,22 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 			}
 
 			logger.WithField("device_count", len(masterManifest.Devices)).Info("Read existing master manifest")
+
+			// Idempotent check: if master manifest already reflects the desired state,
+			// skip the write to break livelock with any concurrent writer.
+			if existingInfo, ok := masterManifest.Devices[deviceType]; ok {
+				expectedStability := stability
+				if expectedStability == "" {
+					expectedStability = "stable"
+				}
+				correctVersion := (isNightly && existingInfo.LatestNightly == version) ||
+					(!isNightly && existingInfo.Latest == version)
+				expectedPath := fmt.Sprintf("manifests/%s.json", deviceType)
+				if correctVersion && existingInfo.ManifestPath == expectedPath && existingInfo.Stability == expectedStability {
+					logger.Info("Master manifest already up-to-date, skipping write")
+					return nil
+				}
+			}
 		} else {
 			// Create new manifest if it doesn't exist
 			logger.WithError(err).Info("Creating new master manifest as it doesn't exist")

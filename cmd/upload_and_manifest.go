@@ -1080,7 +1080,7 @@ func main() {
 			"is_nightly":  *nightly,
 			"stability":   *stability,
 		})
-		if err := updateMasterManifest(ctx, logger, bucket, *deviceType, *version, *nightly, *stability); err != nil {
+		if err := updateMasterManifest(ctx, logger, bucket, *deviceType, *version, *nightly, *stability, true); err != nil {
 			log.WithError(err).Fatal("Failed to update master manifest")
 		}
 		return
@@ -1565,7 +1565,7 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 
 		go func() {
 			defer wg.Done()
-			masterErrChan <- updateMasterManifest(ctx, masterLogger, bucket, deviceType, version, isNightly, stability)
+			masterErrChan <- updateMasterManifest(ctx, masterLogger, bucket, deviceType, version, isNightly, stability, false)
 		}()
 
 		wg.Wait()
@@ -1773,7 +1773,7 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 	return fmt.Errorf("failed to write device manifest after %d attempts: concurrent writers", maxRetries)
 }
 
-func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version string, isNightly bool, stability string) error {
+func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version string, isNightly bool, stability string, forceWrite bool) error {
 	masterManifestPath := "manifests/master.json"
 	logger = logger.WithField("manifest_path", masterManifestPath)
 	logger.Info("Processing master manifest")
@@ -1864,17 +1864,23 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 		masterManifest.Devices[deviceType] = deviceInfo
 
-		// Write back to bucket using GenerationMatch to prevent lost updates from
-		// concurrent writers. Use DoesNotExist when creating a new object because
-		// GenerationMatch:0 is the zero value and the GCS client rejects it as "empty conditions".
 		logger.Info("Writing master manifest back to bucket")
-		var masterConds storage.Conditions
-		if generation == 0 {
-			masterConds = storage.Conditions{DoesNotExist: true}
+		var w *storage.Writer
+		if forceWrite {
+			// Unconditional write: the caller guarantees exclusive access (e.g. publish
+			// job with a concurrency group). Avoids livelock from any mystery concurrent
+			// writer because we are the authoritative publisher.
+			w = obj.NewWriter(ctx)
 		} else {
-			masterConds = storage.Conditions{GenerationMatch: generation}
+			// Use GenerationMatch so concurrent build jobs don't clobber each other.
+			var masterConds storage.Conditions
+			if generation == 0 {
+				masterConds = storage.Conditions{DoesNotExist: true}
+			} else {
+				masterConds = storage.Conditions{GenerationMatch: generation}
+			}
+			w = obj.If(masterConds).NewWriter(ctx)
 		}
-		w := obj.If(masterConds).NewWriter(ctx)
 
 		// Marshal to JSON with indentation
 		content, err := json.MarshalIndent(masterManifest, "", "  ")

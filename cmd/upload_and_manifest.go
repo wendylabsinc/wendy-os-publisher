@@ -69,6 +69,19 @@ type VersionMetadata struct {
 	RecoveryPath       string     `json:"recovery_path,omitempty"`
 	RecoveryChecksum   string     `json:"recovery_checksum,omitempty"`
 	RecoverySizeBytes  int64      `json:"recovery_size_bytes,omitempty"`
+	// Storage-specific image paths for devices that produce multiple artifacts
+	// (e.g. jetson-orin-nano which ships both an NVMe and an SD card image).
+	// Path above stays set to the NVMe image for backwards compatibility with
+	// older CLI versions that only know about the single Path field.
+	NVMEPath        string `json:"nvme_path,omitempty"`
+	NVMEChecksum    string `json:"nvme_checksum,omitempty"`
+	NVMESizeBytes   int64  `json:"nvme_size_bytes,omitempty"`
+	SDCardPath      string `json:"sd_path,omitempty"`
+	SDCardChecksum  string `json:"sd_checksum,omitempty"`
+	SDCardSizeBytes int64  `json:"sd_size_bytes,omitempty"`
+	EMMCPath        string `json:"emmc_path,omitempty"`
+	EMMCChecksum    string `json:"emmc_checksum,omitempty"`
+	EMMCSizeBytes   int64  `json:"emmc_size_bytes,omitempty"`
 }
 
 // MasterManifest represents the top-level manifest
@@ -881,6 +894,7 @@ func main() {
 	localFile := flag.String("file", "", "Local file path to upload")
 	otaUpdateFile := flag.String("ota-update", "", "Local OTA update file path to upload")
 	recoveryFile := flag.String("recovery-file", "", "Optional recovery/tegraflash file path to upload")
+	storage := flag.String("storage", "", "Storage type for multi-artifact devices: nvme or sd (omit for single-storage devices)")
 	updateOnly := flag.Bool("update-only", false, "Only update manifests without uploading")
 	skipMasterManifest := flag.Bool("skip-master-manifest", false, "Skip master manifest update (a separate job will handle it)")
 	masterManifestOnly := flag.Bool("master-manifest-only", false, "Only update the master manifest, skip upload and device manifest")
@@ -996,6 +1010,9 @@ func main() {
 		}
 		if err := validateStability(*stability); err != nil {
 			log.WithError(err).Fatal("Invalid stability")
+		}
+		if *storage != "" && *storage != "nvme" && *storage != "sd" && *storage != "emmc" {
+			log.Fatalf("Invalid --storage value %q: must be nvme, sd, or emmc", *storage)
 		}
 		if !*updateOnly && !*masterManifestOnly {
 			// At least one file (main, OTA, or recovery) must be provided
@@ -1277,7 +1294,7 @@ func main() {
 			mainUpload.path, mainUpload.size, mainResult.checksum,
 			otaUpdateUpload.path, otaUpdateUpload.size, otaUpdateResult.checksum,
 			recoveryUpload.path, recoveryUpload.size, recoveryResult.checksum,
-			*nightly, *stability, *notifyDiscord, *skipMasterManifest,
+			*storage, *nightly, *stability, *notifyDiscord, *skipMasterManifest,
 		)
 	} else {
 		// Just update manifests for existing file
@@ -1351,7 +1368,7 @@ func main() {
 			recoverySize = recoveryAttrs.Size
 		}
 
-		updateManifests(ctx, bucket, *deviceType, *version, imagePath, attrs.Size, mainChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, *nightly, *stability, *notifyDiscord, *skipMasterManifest)
+		updateManifests(ctx, bucket, *deviceType, *version, imagePath, attrs.Size, mainChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, *storage, *nightly, *stability, *notifyDiscord, *skipMasterManifest)
 	}
 }
 
@@ -1512,7 +1529,7 @@ func uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, de
 	return destinationPath, nil
 }
 
-func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, fileChecksum string, otaUpdatePath string, otaUpdateSize int64, otaUpdateChecksum string, recoveryPath string, recoverySize int64, recoveryChecksum string, isNightly bool, stability string, notifyDiscord bool, skipMasterManifest bool) {
+func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, fileChecksum string, otaUpdatePath string, otaUpdateSize int64, otaUpdateChecksum string, recoveryPath string, recoverySize int64, recoveryChecksum string, storage string, isNightly bool, stability string, notifyDiscord bool, skipMasterManifest bool) {
 	logger := log.WithFields(logrus.Fields{
 		"device_type":     deviceType,
 		"version":         version,
@@ -1538,7 +1555,7 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 
 	if skipMasterManifest {
 		logger.Info("Updating device manifest (master manifest will be updated by a separate publish job)")
-		if err := updateDeviceManifest(ctx, deviceLogger, bucket, deviceType, version, filePath, fileSize, fileChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, isNightly); err != nil {
+		if err := updateDeviceManifest(ctx, deviceLogger, bucket, deviceType, version, filePath, fileSize, fileChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, storage, isNightly); err != nil {
 			logger.WithError(err).Fatal("Failed to update device manifest")
 		}
 	} else {
@@ -1560,7 +1577,7 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 
 		go func() {
 			defer wg.Done()
-			deviceErrChan <- updateDeviceManifest(ctx, deviceLogger, bucket, deviceType, version, filePath, fileSize, fileChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, isNightly)
+			deviceErrChan <- updateDeviceManifest(ctx, deviceLogger, bucket, deviceType, version, filePath, fileSize, fileChecksum, otaUpdatePath, otaUpdateSize, otaUpdateChecksum, recoveryPath, recoverySize, recoveryChecksum, storage, isNightly)
 		}()
 
 		go func() {
@@ -1591,7 +1608,7 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 	}
 }
 
-func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, fileChecksum string, otaUpdatePath string, otaUpdateSize int64, otaUpdateChecksum string, recoveryPath string, recoverySize int64, recoveryChecksum string, isNightly bool) error {
+func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, version, filePath string, fileSize int64, fileChecksum string, otaUpdatePath string, otaUpdateSize int64, otaUpdateChecksum string, recoveryPath string, recoverySize int64, recoveryChecksum string, storageType string, isNightly bool) error {
 	manifestPath := fmt.Sprintf("manifests/%s.json", deviceType)
 	logger = logger.WithField("manifest_path", manifestPath)
 	logger.Info("Processing device manifest")
@@ -1681,16 +1698,62 @@ func updateDeviceManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 		versionMetadata.IsLatest = true
 		versionMetadata.IsNightly = isNightly
 
-		// Update OS image fields only if provided (filePath not empty)
+		// Update OS image fields only if provided (filePath not empty).
+		// When a storage type is specified the image is stored in the
+		// type-specific field as well. For "nvme" the legacy Path field is
+		// also updated so that older CLI versions continue to work. For "sd"
+		// Path is only set when no prior value exists (i.e. this is the first
+		// image ever published for this version).
 		if filePath != "" {
-			versionMetadata.Path = filePath
-			versionMetadata.Checksum = fileChecksum
-			versionMetadata.SizeBytes = fileSize
-			logger.WithFields(logrus.Fields{
-				"path":     filePath,
-				"size":     fileSize,
-				"checksum": fileChecksum,
-			}).Info("Updating OS image metadata")
+			switch storageType {
+			case "nvme":
+				versionMetadata.NVMEPath = filePath
+				versionMetadata.NVMEChecksum = fileChecksum
+				versionMetadata.NVMESizeBytes = fileSize
+				// Also update the legacy Path field for backwards compat.
+				versionMetadata.Path = filePath
+				versionMetadata.Checksum = fileChecksum
+				versionMetadata.SizeBytes = fileSize
+				logger.WithFields(logrus.Fields{
+					"path": filePath, "size": fileSize, "checksum": fileChecksum,
+				}).Info("Updating NVMe image metadata")
+			case "sd":
+				versionMetadata.SDCardPath = filePath
+				versionMetadata.SDCardChecksum = fileChecksum
+				versionMetadata.SDCardSizeBytes = fileSize
+				// Set the legacy Path only when it has not been set yet (no NVMe image
+				// has been published for this version). Once an NVMe image is present,
+				// Path must remain pointing to that image for old CLIs.
+				if versionMetadata.Path == "" {
+					versionMetadata.Path = filePath
+					versionMetadata.Checksum = fileChecksum
+					versionMetadata.SizeBytes = fileSize
+				}
+				logger.WithFields(logrus.Fields{
+					"path": filePath, "size": fileSize, "checksum": fileChecksum,
+				}).Info("Updating SD card image metadata")
+			case "emmc":
+				versionMetadata.EMMCPath = filePath
+				versionMetadata.EMMCChecksum = fileChecksum
+				versionMetadata.EMMCSizeBytes = fileSize
+				if versionMetadata.Path == "" {
+					versionMetadata.Path = filePath
+					versionMetadata.Checksum = fileChecksum
+					versionMetadata.SizeBytes = fileSize
+				}
+				logger.WithFields(logrus.Fields{
+					"path": filePath, "size": fileSize, "checksum": fileChecksum,
+				}).Info("Updating eMMC image metadata")
+			default:
+				versionMetadata.Path = filePath
+				versionMetadata.Checksum = fileChecksum
+				versionMetadata.SizeBytes = fileSize
+				logger.WithFields(logrus.Fields{
+					"path":     filePath,
+					"size":     fileSize,
+					"checksum": fileChecksum,
+				}).Info("Updating OS image metadata")
+			}
 		}
 
 		// Update OTA update fields only if provided

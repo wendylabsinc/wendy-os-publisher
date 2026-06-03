@@ -1906,19 +1906,23 @@ func updateMasterManifest(ctx context.Context, logger *logrus.Entry, bucket *sto
 
 			logger.WithField("device_count", len(masterManifest.Devices)).Info("Read existing master manifest")
 
-			// Idempotent check: if master manifest already reflects the desired state,
-			// skip the write to break livelock with any concurrent writer.
-			if existingInfo, ok := masterManifest.Devices[deviceType]; ok {
-				expectedStability := stability
-				if expectedStability == "" {
-					expectedStability = "stable"
-				}
-				correctVersion := (isNightly && existingInfo.LatestNightly == version) ||
-					(!isNightly && existingInfo.Latest == version)
-				expectedPath := fmt.Sprintf("manifests/%s.json", deviceType)
-				if correctVersion && existingInfo.ManifestPath == expectedPath && existingInfo.Stability == expectedStability {
-					logger.Info("Master manifest already up-to-date, skipping write")
-					return nil
+			// Idempotent check: skip only for concurrent build jobs (forceWrite=false)
+			// to break livelock. Force-write callers (the serialised publish job) must
+			// always write so that last_updated is refreshed even when the version string
+			// hasn't changed (e.g. repeated nightly builds with the same version tag).
+			if !forceWrite {
+				if existingInfo, ok := masterManifest.Devices[deviceType]; ok {
+					expectedStability := stability
+					if expectedStability == "" {
+						expectedStability = "stable"
+					}
+					correctVersion := (isNightly && existingInfo.LatestNightly == version) ||
+						(!isNightly && existingInfo.Latest == version)
+					expectedPath := fmt.Sprintf("manifests/%s.json", deviceType)
+					if correctVersion && existingInfo.ManifestPath == expectedPath && existingInfo.Stability == expectedStability {
+						logger.Info("Master manifest already up-to-date, skipping write")
+						return nil
+					}
 				}
 			}
 		} else {
@@ -2245,6 +2249,38 @@ func promoteNightlyToStable(ctx context.Context, bucket *storage.BucketHandle, d
 		}
 	}
 
+	// Copy NVME image if present
+	var nvmeDestPath, nvmeChecksum string
+	if sourceVersionMeta.NVMEPath != "" {
+		nvmeParts := strings.Split(sourceVersionMeta.NVMEPath, "/")
+		if len(nvmeParts) >= 4 {
+			nvmeDestPath = fmt.Sprintf("images/%s/%s/%s", deviceType, stableVersion, nvmeParts[len(nvmeParts)-1])
+			if _, err := bucket.Object(nvmeDestPath).CopierFrom(bucket.Object(sourceVersionMeta.NVMEPath)).Run(ctx); err != nil {
+				logger.WithError(err).Warn("Failed to copy NVME image, continuing without it")
+				nvmeDestPath = ""
+			} else {
+				nvmeChecksum = sourceVersionMeta.NVMEChecksum
+				logger.Info("NVME image copied successfully")
+			}
+		}
+	}
+
+	// Copy SD card image if present
+	var sdDestPath, sdChecksum string
+	if sourceVersionMeta.SDCardPath != "" {
+		sdParts := strings.Split(sourceVersionMeta.SDCardPath, "/")
+		if len(sdParts) >= 4 {
+			sdDestPath = fmt.Sprintf("images/%s/%s/%s", deviceType, stableVersion, sdParts[len(sdParts)-1])
+			if _, err := bucket.Object(sdDestPath).CopierFrom(bucket.Object(sourceVersionMeta.SDCardPath)).Run(ctx); err != nil {
+				logger.WithError(err).Warn("Failed to copy SD card image, continuing without it")
+				sdDestPath = ""
+			} else {
+				sdChecksum = sourceVersionMeta.SDCardChecksum
+				logger.Info("SD card image copied successfully")
+			}
+		}
+	}
+
 	// Create new stable version entry with promotion metadata
 	promotedAt := time.Now()
 	sourceVersion := nightlyVersion
@@ -2258,6 +2294,10 @@ func promoteNightlyToStable(ctx context.Context, bucket *storage.BucketHandle, d
 		IsNightly:          false,
 		PromotedFrom:       &sourceVersion,
 		PromotedAt:         &promotedAt,
+		NVMEPath:           nvmeDestPath,
+		NVMEChecksum:       nvmeChecksum,
+		SDCardPath:         sdDestPath,
+		SDCardChecksum:     sdChecksum,
 		OTAUpdatePath:      otaDestPath,
 		OTAUpdateChecksum:  sourceVersionMeta.OTAUpdateChecksum,
 		OTAUpdateSizeBytes: sourceVersionMeta.OTAUpdateSizeBytes,
@@ -2308,7 +2348,9 @@ func promoteNightlyToStable(ctx context.Context, bucket *storage.BucketHandle, d
 	logger.Info("Successfully updated device manifest")
 
 	// Update master manifest
-	updateMasterManifestForPromotion(ctx, logger, bucket, deviceType, stableVersion)
+	if err := updateMasterManifestForPromotion(ctx, logger, bucket, deviceType, stableVersion); err != nil {
+		logger.WithError(err).Fatal("Failed to update master manifest after promotion")
+	}
 
 	logger.WithField("stable_version", stableVersion).Info("Successfully promoted nightly to stable")
 
@@ -2320,53 +2362,72 @@ func promoteNightlyToStable(ctx context.Context, bucket *storage.BucketHandle, d
 }
 
 // updateMasterManifestForPromotion updates master manifest after promotion
-func updateMasterManifestForPromotion(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, stableVersion string) {
+func updateMasterManifestForPromotion(ctx context.Context, logger *logrus.Entry, bucket *storage.BucketHandle, deviceType, stableVersion string) error {
 	masterManifestPath := "manifests/master.json"
 	obj := bucket.Object(masterManifestPath)
 
-	var masterManifest MasterManifest
-	r, err := obj.NewReader(ctx)
-	if err != nil {
-		logger.WithError(err).Fatal("Failed to read master manifest")
+	const maxRetries = 10
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		r, err := obj.NewReader(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to read master manifest: %w", err)
+		}
+		content, err := io.ReadAll(r)
+		generation := r.Attrs.Generation
+		r.Close()
+		if err != nil {
+			return fmt.Errorf("failed to read master manifest content: %w", err)
+		}
+
+		var masterManifest MasterManifest
+		if err := json.Unmarshal(content, &masterManifest); err != nil {
+			return fmt.Errorf("failed to decode master manifest: %w", err)
+		}
+
+		deviceInfo, exists := masterManifest.Devices[deviceType]
+		if !exists {
+			return fmt.Errorf("device %q does not exist in master manifest", deviceType)
+		}
+
+		// Idempotency on retries: if a concurrent writer already set the stable
+		// version, accept that as success rather than burning another attempt.
+		if attempt > 1 && deviceInfo.Latest == stableVersion {
+			logger.Info("Master manifest already reflects promoted stable version")
+			return nil
+		}
+
+		deviceInfo.Latest = stableVersion
+		masterManifest.Devices[deviceType] = deviceInfo
+		masterManifest.LastUpdated = time.Now()
+
+		manifestContent, err := json.MarshalIndent(masterManifest, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal master manifest: %w", err)
+		}
+
+		w := obj.If(storage.Conditions{GenerationMatch: generation}).NewWriter(ctx)
+		if _, err := w.Write(manifestContent); err != nil {
+			w.Close()
+			return fmt.Errorf("failed to write master manifest: %w", err)
+		}
+		if err := w.Close(); err != nil {
+			var gErr *googleapi.Error
+			if errors.As(err, &gErr) && gErr.Code == 412 && attempt < maxRetries {
+				backoff := time.Duration(1<<uint(attempt))*100*time.Millisecond + time.Duration(rand.Intn(200))*time.Millisecond
+				if backoff > 10*time.Second {
+					backoff = 10 * time.Second
+				}
+				logger.WithField("attempt", attempt).Warn("Master manifest write lost race (412), retrying...")
+				time.Sleep(backoff)
+				continue
+			}
+			return fmt.Errorf("failed to finalize master manifest write: %w", err)
+		}
+
+		logger.Info("Successfully updated master manifest")
+		return nil
 	}
-	defer r.Close()
-
-	content, err := io.ReadAll(r)
-	if err != nil {
-		logger.WithError(err).Fatal("Failed to read master manifest content")
-	}
-
-	if err := json.Unmarshal(content, &masterManifest); err != nil {
-		logger.WithError(err).Fatal("Failed to decode master manifest")
-	}
-
-	masterManifest.LastUpdated = time.Now()
-
-	deviceInfo, exists := masterManifest.Devices[deviceType]
-	if !exists {
-		logger.Fatal("Device does not exist in master manifest")
-	}
-
-	deviceInfo.Latest = stableVersion
-	masterManifest.Devices[deviceType] = deviceInfo
-
-	w := obj.NewWriter(ctx)
-
-	manifestContent, err := json.MarshalIndent(masterManifest, "", "  ")
-	if err != nil {
-		logger.WithError(err).Fatal("Failed to marshal master manifest")
-	}
-
-	if _, err := w.Write(manifestContent); err != nil {
-		w.Close()
-		logger.WithError(err).Fatal("Failed to write master manifest")
-	}
-
-	if err := w.Close(); err != nil {
-		logger.WithError(err).Fatal("Failed to finalize master manifest write")
-	}
-
-	logger.Info("Successfully updated master manifest")
+	return fmt.Errorf("failed to update master manifest after %d attempts", maxRetries)
 }
 
 // swapImageFile replaces an existing version's image file while preserving metadata

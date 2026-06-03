@@ -32,6 +32,9 @@ var log = logrus.New()
 // discordWebhookURL is read from the DISCORD_WEBHOOK_URL environment variable.
 var discordWebhookURL = os.Getenv("DISCORD_WEBHOOK_URL")
 
+// discordReleaseWebhookURL is read from the DISCORD_RELEASE_WEBHOOK_URL environment variable.
+var discordReleaseWebhookURL = os.Getenv("DISCORD_RELEASE_WEBHOOK_URL")
+
 // Discord embed colors
 const (
 	colorStable  = 0x00FF00 // Green for stable builds
@@ -690,9 +693,9 @@ func compressFile(ctx context.Context, inputPath string, fileType string) (strin
 }
 
 // sendDiscordNotification sends a notification to Discord about the update
-func sendDiscordNotification(deviceType, version string, isNightly bool, osSize int64, otaSize int64, recoverySize int64) error {
-	if discordWebhookURL == "" {
-		return fmt.Errorf("DISCORD_WEBHOOK_URL environment variable is not set")
+func sendDiscordNotification(webhookURL string, deviceType, version string, isNightly bool, osSize int64, otaSize int64, recoverySize int64) error {
+	if webhookURL == "" {
+		return fmt.Errorf("Discord webhook URL is not set")
 	}
 	buildType := "Stable"
 	color := colorStable
@@ -809,7 +812,7 @@ func sendDiscordNotification(deviceType, version string, isNightly bool, osSize 
 		Timeout: 30 * time.Second,
 	}
 
-	resp, err := client.Post(discordWebhookURL, "application/json", bytes.NewBuffer(jsonData))
+	resp, err := client.Post(webhookURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to send Discord notification: %w", err)
 	}
@@ -1082,7 +1085,7 @@ func main() {
 		if !exists {
 			log.Fatalf("Version %s not found in manifest for device %s", *version, *deviceType)
 		}
-		if err := sendDiscordNotification(*deviceType, *version, versionMeta.IsNightly, versionMeta.SizeBytes, versionMeta.OTAUpdateSizeBytes, versionMeta.RecoverySizeBytes); err != nil {
+		if err := sendDiscordNotification(discordWebhookURL, *deviceType, *version, versionMeta.IsNightly, versionMeta.SizeBytes, versionMeta.OTAUpdateSizeBytes, versionMeta.RecoverySizeBytes); err != nil {
 			log.WithError(err).Fatal("Failed to send Discord notification")
 		}
 		log.Info("Discord notification sent successfully")
@@ -1145,7 +1148,7 @@ func main() {
 
 	// Promote nightly to stable if requested
 	if *promote {
-		promoteNightlyToStable(ctx, bucket, *deviceType, *version)
+		promoteNightlyToStable(ctx, bucket, *deviceType, *version, *notifyDiscord)
 		return
 	}
 
@@ -1602,7 +1605,7 @@ func updateManifests(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 	// Send Discord notification if requested
 	if notifyDiscord {
 		logger.Info("Sending Discord notification")
-		if err := sendDiscordNotification(deviceType, version, isNightly, fileSize, otaUpdateSize, recoverySize); err != nil {
+		if err := sendDiscordNotification(discordWebhookURL, deviceType, version, isNightly, fileSize, otaUpdateSize, recoverySize); err != nil {
 			logger.WithError(err).Warn("Failed to send Discord notification (update was still successful)")
 		}
 	}
@@ -2084,7 +2087,7 @@ func createNewDevice(ctx context.Context, bucket *storage.BucketHandle, deviceTy
 }
 
 // promoteNightlyToStable promotes a nightly build to stable release by removing "nightly" from version name
-func promoteNightlyToStable(ctx context.Context, bucket *storage.BucketHandle, deviceType, nightlyVersion string) {
+func promoteNightlyToStable(ctx context.Context, bucket *storage.BucketHandle, deviceType, nightlyVersion string, notifyDiscord bool) {
 	logger := log.WithFields(logrus.Fields{
 		"device_type":     deviceType,
 		"nightly_version": nightlyVersion,
@@ -2275,6 +2278,12 @@ func promoteNightlyToStable(ctx context.Context, bucket *storage.BucketHandle, d
 	updateMasterManifestForPromotion(ctx, logger, bucket, deviceType, stableVersion)
 
 	logger.WithField("stable_version", stableVersion).Info("Successfully promoted nightly to stable")
+
+	if notifyDiscord {
+		if err := sendDiscordNotification(discordReleaseWebhookURL, deviceType, stableVersion, false, stableVersionMeta.SizeBytes, stableVersionMeta.OTAUpdateSizeBytes, stableVersionMeta.RecoverySizeBytes); err != nil {
+			logger.WithError(err).Warn("Failed to send Discord notification")
+		}
+	}
 }
 
 // updateMasterManifestForPromotion updates master manifest after promotion

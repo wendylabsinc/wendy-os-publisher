@@ -29,6 +29,33 @@ import (
 
 var log = logrus.New()
 
+// gcloudTokenSource implements oauth2.TokenSource. It seeds with the caller's
+// initial access token and refreshes by running "gcloud auth print-access-token"
+// once the token is within 10 seconds of expiry (the oauth2 package's Valid()
+// check applies a 10-second buffer).
+type gcloudTokenSource struct {
+	mu    sync.Mutex
+	token *oauth2.Token
+}
+
+func (s *gcloudTokenSource) Token() (*oauth2.Token, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.token != nil && s.token.Valid() {
+		return s.token, nil
+	}
+	out, err := exec.Command("gcloud", "auth", "print-access-token").Output()
+	if err != nil {
+		return nil, fmt.Errorf("gcloud token refresh failed: %w", err)
+	}
+	s.token = &oauth2.Token{
+		AccessToken: strings.TrimSpace(string(out)),
+		TokenType:   "Bearer",
+		Expiry:      time.Now().Add(55 * time.Minute),
+	}
+	return s.token, nil
+}
+
 // discordWebhookURL is read from the DISCORD_WEBHOOK_URL environment variable.
 var discordWebhookURL = os.Getenv("DISCORD_WEBHOOK_URL")
 
@@ -834,14 +861,20 @@ func sendDiscordNotification(webhookURL string, deviceType, version string, isNi
 
 // createStorageClientWithAuth creates a storage client and triggers authentication if needed
 func createStorageClientWithAuth(ctx context.Context, accessToken string) (*storage.Client, error) {
-	// If an access token is provided, use it directly
+	// If an access token is provided, seed the refreshing token source with it.
+	// GCP access tokens expire after 1 hour; gcloudTokenSource re-runs
+	// "gcloud auth print-access-token" when the token is near expiry so that
+	// long-running retry loops (412 backoff) don't hit 401 mid-flight.
 	if accessToken != "" {
 		log.Info("Using provided access token for authentication")
-		tokenSource := oauth2.StaticTokenSource(&oauth2.Token{
-			AccessToken: accessToken,
-			TokenType:   "Bearer",
-		})
-		client, err := storage.NewClient(ctx, option.WithTokenSource(tokenSource))
+		ts := &gcloudTokenSource{
+			token: &oauth2.Token{
+				AccessToken: accessToken,
+				TokenType:   "Bearer",
+				Expiry:      time.Now().Add(55 * time.Minute),
+			},
+		}
+		client, err := storage.NewClient(ctx, option.WithTokenSource(ts))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create storage client with access token: %w", err)
 		}

@@ -186,6 +186,8 @@ func TestIsOSImage(t *testing.T) {
 		{"image.IMG", true},
 		{"image.wic", true},
 		{"image.WIC", true},
+		{"image.sdimg", true},
+		{"image.SDIMG", true},
 		{"archive.zip", true},
 		{"archive.tgz", true},
 		{"compressed.xz", true},

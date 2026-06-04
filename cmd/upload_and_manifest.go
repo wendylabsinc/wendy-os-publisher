@@ -210,7 +210,7 @@ func printProgress(read int64, total int64, percent int) {
 // isOSImage checks if a file is an OS image based on its extension
 func isOSImage(filename string) bool {
 	ext := strings.ToLower(filepath.Ext(filename))
-	result := ext == ".img" || ext == ".wic" || ext == ".zip" || ext == ".tgz" || ext == ".xz" || ext == ".zst" || ext == ".mender"
+	result := ext == ".img" || ext == ".wic" || ext == ".sdimg" || ext == ".zip" || ext == ".tgz" || ext == ".xz" || ext == ".zst" || ext == ".mender"
 	log.WithFields(logrus.Fields{
 		"filename":  filename,
 		"extension": ext,
@@ -489,7 +489,7 @@ func compressFile(ctx context.Context, inputPath string, fileType string) (strin
 	compressionMethod := ""
 
 	switch ext {
-	case ".img", ".wic":
+	case ".img", ".wic", ".sdimg":
 		// Raw disk images should be compressed
 		shouldCompress = true
 		if fileType == "ota" {

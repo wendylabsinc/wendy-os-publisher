@@ -482,6 +482,15 @@ func compressFile(ctx context.Context, inputPath string, fileType string) (strin
 		return inputPath, nil
 	}
 
+	// Resolve symlinks before compression — Yocto deploy directories use
+	// chains of versioned symlinks for build artifacts, and the compressor
+	// will hit ELOOP if it tries to follow them itself.
+	realPath, err := filepath.EvalSymlinks(inputPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve symlinks for %s: %w", inputPath, err)
+	}
+	inputPath = realPath
+
 	ext := strings.ToLower(filepath.Ext(inputPath))
 
 	// Determine if file should be compressed based on extension and type
@@ -1517,6 +1526,21 @@ func uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, de
 	filename := filepath.Base(localPath)
 	destinationPath := fmt.Sprintf("images/%s/%s/%s", deviceType, version, filename)
 
+	// Skip re-upload if the object already exists in GCS with the same size.
+	// This makes outer-retry loops (used to survive 412 manifest races when
+	// multiple storage variants write the same device manifest concurrently)
+	// fast — they skip the multi-minute image upload and go straight to the
+	// manifest update, dramatically shrinking the contention window.
+	localInfo, err := os.Stat(localPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to stat local file: %w", err)
+	}
+	obj := bucket.Object(destinationPath)
+	if existingAttrs, err := obj.Attrs(ctx); err == nil && existingAttrs.Size == localInfo.Size() {
+		log.WithField("path", destinationPath).Info("File already in GCS with matching size, skipping upload")
+		return destinationPath, nil
+	}
+
 	log.WithFields(logrus.Fields{
 		"local_path":  localPath,
 		"destination": destinationPath,
@@ -1530,8 +1554,7 @@ func uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, de
 	}
 	defer file.Close()
 
-	// Create the destination object
-	obj := bucket.Object(destinationPath)
+	// Create the destination object writer
 	w := obj.NewWriter(ctx)
 
 	// Set content type based on extension
